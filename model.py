@@ -48,6 +48,10 @@ class CastedLinear(nn.Linear):
     def forward(self, x):
         return F.linear(x, self.weight.type_as(x), self.bias.type_as(x) if self.bias is not None else None)
 
+class SliceLinear(nn.Linear):
+    def forward(self, x): # can take n_features larger than weight
+        return F.linear(x[..., :self.weight.size(-1)], self.weight.type_as(x), self.bias.type_as(x) if self.bias is not None else None)
+
 class CausalAttn(nn.Module):
     def __init__(self, dim, num_heads):
         super().__init__()
@@ -57,17 +61,24 @@ class CausalAttn(nn.Module):
         self.k_lin = CastedLinear(dim, dim)
         self.v_lin = CastedLinear(dim, dim)
         self.o_lin = CastedLinear(dim, dim)
+        self.attn_gate = SliceLinear(20, num_heads)
         
     def forward(self, x, rope):
         B, T, D = x.shape
-        q = self.q_lin(x).view(B, T, self.num_heads, self.head_dim)#.transpose(1, 2)
-        k = self.k_lin(x).view(B, T, self.num_heads, self.head_dim)#.transpose(1, 2)
-        v = self.v_lin(x).view(B, T, self.num_heads, self.head_dim)#.transpose(1, 2)
+        q = self.q_lin(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.k_lin(x).view(B, T, self.num_heads, self.head_dim)
+        v = self.v_lin(x).view(B, T, self.num_heads, self.head_dim)
         
         q, k = rope(q), rope(k)
+
+        #q = q.transpose(1, 2)
+        #k = k.transpose(1, 2)
+        #v = v.transpose(1, 2)
+        
         
         #o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         o = flash_attn_func(q, k, v, causal=True)
+        o = o * torch.sigmoid(self.attn_gate(x).view(B, T, self.num_heads, 1))
         #o = o.transpose(1, 2).contiguous()
         o = o.view(B, T, D)
         return self.o_lin(o)

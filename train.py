@@ -14,7 +14,7 @@ from model import Model
 steps = 5000
 print_every = 50
 grad_accum_steps = 16
-log_dir = "runs/simple/optimized5"
+log_dir = "runs/simple/1"
 lr = 6e-4
 
 
