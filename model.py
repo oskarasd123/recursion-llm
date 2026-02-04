@@ -16,6 +16,7 @@ class MLP(nn.Module):
         super().__init__()
         self.up_lin = CastedLinear(dim, dim * 4)
         self.down_lin = CastedLinear(dim * 4, dim)
+        self.down_lin.weight.data.zero_()
     
     def forward(self, x):
         return self.down_lin(F.gelu(self.up_lin(x)))
@@ -50,14 +51,16 @@ class SliceLinear(nn.Linear):
         return F.linear(x[..., :self.weight.size(-1)], self.weight.type_as(x), self.bias.type_as(x) if self.bias is not None else None)
 
 class CausalAttn(nn.Module):
-    def __init__(self, dim, num_heads):
+    def __init__(self, dim, num_heads, window_size = -1):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.window_size = window_size
         self.q_lin = CastedLinear(dim, dim)
         self.k_lin = CastedLinear(dim, dim)
         self.v_lin = CastedLinear(dim, dim)
         self.o_lin = CastedLinear(dim, dim)
+        self.o_lin.weight.data.zero_()
         self.attn_gate = SliceLinear(20, num_heads)
         
     def forward(self, x, rope):
@@ -73,7 +76,7 @@ class CausalAttn(nn.Module):
         #v = v.transpose(1, 2)
         
         #o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        o = flash_attn_func(q, k, v, causal=True)
+        o = flash_attn_func(q, k, v, causal=True, window_size=(self.window_size, 0))
         o = o * torch.sigmoid(self.attn_gate(x).view(B, T, self.num_heads, 1))
         #o = o.transpose(1, 2).contiguous()
         o = o.view(B, T, D)
@@ -101,12 +104,13 @@ class Model(nn.Module):
         self.rope = ROPE(dim//num_heads, 10000, max_seq_len)
         self.un_embed = CastedLinear(dim, num_embeddings, bias=False)
         self.end_mlp = MLP(dim)
+        self.middle_block = Block(dim, num_heads)
         
         # Weight tying (optional but standard and helps convergence)
         self.embed.weight = self.un_embed.weight 
 
 
-    def forward(self, ids):
+    def forward(self, ids, recursion_steps = 4):
         x = self.embed(ids).to(torch.bfloat16)
         half = len(self.blocks)//2
         skip_connections = []
@@ -115,6 +119,9 @@ class Model(nn.Module):
             x = block(x, self.rope)
         if len(self.blocks)%2!=0:
             skip_connections.append(None)
+        for i in range(recursion_steps):
+            x = self.middle_block(x, self.rope)
+        
         for block, x0 in zip(self.blocks[half:], reversed(skip_connections)):
             x = block(x, self.rope, x0=x0)
         x = x + self.end_mlp(norm(x))
