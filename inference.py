@@ -21,13 +21,13 @@ tokenizer.pad_token = tokenizer.eos_token
 
 model = Model(
     num_embeddings=len(tokenizer),
-    dim=512,
+    dim=128*4,
     num_layers=8,
     num_heads=4,
     window_size=128,
 )
 
-state_dict = torch.load("checkpoint.pt")
+state_dict = torch.load("runs/simple/22/checkpoint.pt")
 model.load_state_dict(state_dict["model"])
 
 model.to("cuda")

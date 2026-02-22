@@ -9,11 +9,12 @@ from torch.utils.tensorboard import SummaryWriter
 import time
 import math
 from model import Model
+import json
 
 steps = 5000
 val_every = 200
 grad_accum_steps = 128
-log_dir = "runs/simple/21"
+log_dir = "runs/simple/23"
 lr = 1e-2
 load_checkpoint = False
 
@@ -37,7 +38,7 @@ test_dataloader = DataLoader(dataset.val_data, batch_size=1, num_workers=1)
 
 model = Model(
     num_embeddings=len(tokenizer),
-    dim=512,
+    dim=128*4,
     num_layers=8,
     num_heads=4,
     window_size=128,
@@ -155,17 +156,23 @@ writer.add_scalar("val/loss", val_loss, step*grad_accum_steps)
 print(f"step: {step} | epoch: {epoch} | loss: {np.mean(losses[-val_every:]):.4f} | val loss {val_loss:.4f} | lr mult: {get_lr(step):.2f} | avg time: {(time.time() - start_time)/(step+1):.3f}s")
 
 
-#writer.add_hparams({
-#    "num_layers" : model.num_layers,
-#    "dim" : model.dim,
-#    "num_heads" : model.num_heads,
-#},{
-#    "avg_loss" : np.mean(losses),
-#    "val_loss" : val_loss,
-#})
+
 
 state_dict = {
     "model" : model.state_dict(),
     "optimizers" : [optimizer.state_dict() for optimizer in optimizers]
 }
-torch.save(state_dict, "checkpoint.pt")
+torch.save(state_dict, f"{log_dir}/checkpoint.pt")
+
+json.dump({
+    "hparams": {
+        "num_layers" : model.num_layers,
+        "dim" : model.dim,
+        "num_heads" : model.num_heads,
+        "window_size" : model.window_size,
+    },
+    "metrics" : {
+        "avg_loss" : np.mean(losses),
+        "val_loss" : val_loss,
+    }
+}, open(f"{log_dir}/metrics.json", "w"))
