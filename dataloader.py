@@ -43,7 +43,7 @@ class FineWebDataLoader(IterableDataset):
     def __iter__(self):
         protocol = self.dataset.skip(self.num_val_documents)
         if self.subset != "sample-10BT":
-            protocol = protocol.shuffle(buffer_size=1000, seed=55)
+            protocol = protocol.shuffle(buffer_size=50_000, seed=55)
         else:
             protocol = protocol.shuffle(seed=55)
         for example in protocol:

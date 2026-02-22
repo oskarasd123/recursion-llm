@@ -1,7 +1,7 @@
 import torch
 from torch import nn, Tensor, optim
 import torch.nn.functional as F
-from dataloader import FineWebEduDataLoader
+from dataloader import FineWebDataLoader
 from transformers import AutoTokenizer
 import numpy as np
 from torch.utils.data import DataLoader
@@ -20,10 +20,11 @@ tokenizer.pad_token = tokenizer.eos_token
 
 
 model = Model(
-    len(tokenizer), 
-    512, 
-    4, 
-    4
+    num_embeddings=len(tokenizer),
+    dim=512,
+    num_layers=8,
+    num_heads=4,
+    window_size=128,
 )
 
 state_dict = torch.load("checkpoint.pt")
@@ -31,12 +32,15 @@ model.load_state_dict(state_dict["model"])
 
 model.to("cuda")
 
-
+prev_prompt = "The sin function"
 while True:
     text = input("prompt: ")
+    if text == "r":
+        text = prev_prompt
+    prev_prompt = text
     ids = tokenizer(text, return_tensors="pt")["input_ids"].cuda()
 
-    for i in range(20):
+    for i in range(80):
         logits = model(ids)
         new_id = torch.distributions.Categorical(logits=logits[:,-1]).sample().unsqueeze(0)
         ids = torch.cat([ids, new_id], 1)
