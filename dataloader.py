@@ -4,16 +4,7 @@ from torch.utils.data import IterableDataset, DataLoader
 
 
 
-class ValDataset(IterableDataset):
-    def __init__(self, dataset, tokenizer, max_length=8192, subset="sample-10BT"):
-        self.dataset = dataset
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.num_val_documents = 0
-        self.subset = subset
-    
-    def __iter__(self):
-        return FineWebDataLoader.__iter__(self)
+
 
 
 class FineWebDataLoader(IterableDataset):
@@ -46,6 +37,10 @@ class FineWebDataLoader(IterableDataset):
             protocol = protocol.shuffle(buffer_size=50_000, seed=55)
         else:
             protocol = protocol.shuffle(seed=55)
+        
+        token_buffer = []
+        lengths = []
+        texts = []
         for example in protocol:
             text = example["text"]
             # Tokenize the text
@@ -53,14 +48,39 @@ class FineWebDataLoader(IterableDataset):
                 text,
                 truncation=True,
                 max_length=self.max_length,
-                #padding="max_length",
-                return_tensors="pt"
-            )
-            
-            yield {
-                "input_ids": tokens["input_ids"].squeeze(0),
-                "text": text,
-            }
+            )["input_ids"]
+            if sum(lengths) + len(tokens) > self.max_length:
+                dict = self._prepare_batch(token_buffer, lengths)
+                dict["texts"] = texts
+                yield dict
+                token_buffer = []
+                lengths = []
+                texts = []
+
+            token_buffer.extend(tokens)
+            lengths.append(len(tokens))
+            texts.append(text)
+    
+    def _prepare_batch(self, tokens, lengths):
+        # Create cu_seqlens: [0, len1, len1+len2, ...]
+        cu_seqlens = torch.tensor([0] + torch.cumsum(torch.tensor(lengths), dim=0).tolist(), dtype=torch.int32)
+        
+        return {
+            "input_ids": torch.tensor(tokens, dtype=torch.long),
+            "cu_seqlens": cu_seqlens,
+            "max_seqlen": max(lengths)
+        }
+
+class ValDataset(FineWebDataLoader):
+    def __init__(self, dataset, tokenizer, max_length=8192, subset="sample-10BT"):
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.num_val_documents = 0
+        self.subset = subset
+    
+    def __iter__(self):
+        return FineWebDataLoader.__iter__(self)
 
 # Example Usage:
 if __name__ == "__main__":
@@ -71,29 +91,13 @@ if __name__ == "__main__":
     tokenizer.pad_token = tokenizer.eos_token # GPT2 doesn't have a pad token by default
     
     # Initialize the dataloader
-    dataloader = FineWebDataLoader(tokenizer, subset="sample-10BT", edu=True)
+    dataloader = FineWebDataLoader(tokenizer, subset="sample-10BT", edu=True, max_length=8192)
     dataloader = DataLoader(dataloader, 1, num_workers=1)
 
     iterator = iter(dataloader)
-    text1 = next(iterator)["text"]
-    text2 = next(iterator)["text"]
-
-    num_tokens = 0
-    num_examples = 0
-    above_8192_len = 0
-    start_time = time.time()
-    for example in dataloader:
-        if num_examples%10==0:
-            print(f"{num_examples} {num_tokens/max(1, num_examples):.2f} {above_8192_len/max(1, num_examples)} {(time.time()-start_time)/max(1, num_examples):.5f}\r", end="")
-        numel = example["input_ids"].numel()
-        num_tokens += numel
-        if example["text"] in [text1, text2] and num_examples > 3:
-            print()
-            print(f"repeated text at {num_examples}")
-            break
-        if numel > 8192:
-            above_8192_len += 1
-        num_examples += 1
-        if num_examples > 20_000_000:
-            print("dataset loops")
-            break
+    batch = next(iterator)
+    texts = batch["texts"]
+    ids = batch["input_ids"].squeeze(0)
+    cu_seqlens = batch["cu_seqlens"].squeeze(0)
+    max_seqlen = batch["max_seqlen"]
+    print(ids.shape, cu_seqlens, max_seqlen)

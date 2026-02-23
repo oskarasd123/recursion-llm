@@ -1,3 +1,5 @@
+import os
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 from torch import nn, Tensor, optim
 import torch.nn.functional as F
@@ -10,10 +12,12 @@ import time
 import math
 from model import Model
 import json
+torch._dynamo.config.capture_scalar_outputs = True
 
-steps = 5000
+
+steps = 2500
 val_every = 200
-grad_accum_steps = 128
+grad_accum_steps = 16
 log_dir = "runs/simple/23"
 lr = 1e-2
 load_checkpoint = False
@@ -39,9 +43,10 @@ test_dataloader = DataLoader(dataset.val_data, batch_size=1, num_workers=1)
 model = Model(
     num_embeddings=len(tokenizer),
     dim=128*4,
-    num_layers=8,
+    num_layers=12,
     num_heads=4,
     window_size=128,
+    max_seq_len=8192,
 )
 model.to("cuda")
 
@@ -94,8 +99,35 @@ start_time = time.time()
 losses = []
 train_iter = iter(train_dataloader)
 
+
+profile_steps = 20
+
+def trace_handler(prof: torch.profiler.profile):
+    prof.export_chrome_trace(f"traces/single-chrome-trace.json.gz")
+
+#prof_ctx = torch.profiler.profile(
+#    activities=[
+#        # profile activity on the CPU and GPU
+#        torch.profiler.ProfilerActivity.CPU,
+#        torch.profiler.ProfilerActivity.CUDA,
+#    ],
+#    # Setup the profiler schedule to wait 5 steps, warmup for 5 steps,
+#    # then activate for the remaining steps.
+#    schedule=torch.profiler.schedule(wait=10, warmup=5, active=profile_steps - 15),
+#    # This callback will be fired when the trace files are ready
+#    on_trace_ready=trace_handler,
+#    # Records the file and line number for the operation.
+#    # Disabling this mainly to make the traces less cluttered
+#    with_stack=False,
+#    record_shapes=True,
+#)
+
 model.compile()
+model_opt = model
+#model_opt = torch.compile(model, dynamic=False, fullgraph=True)
+#prof_ctx.__enter__()
 epoch = 0
+documents = 0
 start_time = time.time()
 for step in range(steps):
     for opt in optimizers:
@@ -111,48 +143,58 @@ for step in range(steps):
             batch = next(train_iter)
             epoch += 1
             
-        ids = batch["input_ids"].cuda()
-        logits = model(ids[:,:-1])
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[:,1:].reshape(-1))
+        ids = batch["input_ids"].cuda().squeeze(0)
+        cu_seqlens = batch["cu_seqlens"].cuda().squeeze(0)
+        max_seqlen = batch["max_seqlen"].cuda()
+        logits = model_opt(ids, cu_seqlens, max_seqlen)[:-1, :]
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[1:].reshape(-1))
         loss = loss / grad_accum_steps
         loss.backward()
         loss_accum += loss.item()
+        documents += len(batch["texts"])
+        
     
     for opt in optimizers:
         opt.step()
     model.zero_grad()
 
     losses.append(loss_accum)
-    writer.add_scalar("loss", loss_accum, step*grad_accum_steps)
+    writer.add_scalar("loss", loss_accum, documents)
     
     if step % val_every == 0:
         val_loss = 0
         val_examples = 0
         for batch in test_dataloader:
-            ids = batch["input_ids"].cuda()
-            logits = model(ids[:,:-1])
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[:,1:].reshape(-1))
+            ids = batch["input_ids"].cuda().squeeze(0)
+            cu_seqlens = batch["cu_seqlens"].cuda().squeeze(0)
+            max_seqlen = batch["max_seqlen"].cuda()
+            logits = model_opt(ids, cu_seqlens, max_seqlen)[:-1, :]
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[1:].reshape(-1))
             val_loss += loss.item()
             val_examples += 1
         val_loss /= val_examples
-        writer.add_scalar("val/loss", val_loss, step*grad_accum_steps)
+        writer.add_scalar("val/loss", val_loss, documents)
         print(f"step: {step} | epoch: {epoch} | loss: {np.mean(losses[-val_every:]):.4f} | val loss {val_loss:.4f} | lr mult: {get_lr(step):.2f} | avg time: {(time.time() - start_time)/(step+1):.3f}s")
     if step == 100:
         import gc
         gc.collect()
         torch.cuda.empty_cache()
+    #prof_ctx.step()
+#prof_ctx.__exit__(None, None, None)
 
 # final eval
 val_loss = 0
 val_examples = 0
 for batch in test_dataloader:
-    ids = batch["input_ids"].cuda()
-    logits = model(ids[:,:-1])
-    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[:,1:].reshape(-1))
+    ids = batch["input_ids"].cuda().squeeze(0)
+    cu_seqlens = batch["cu_seqlens"].cuda().squeeze(0)
+    max_seqlen = batch["max_seqlen"].cuda()
+    logits = model_opt(ids, cu_seqlens, max_seqlen)[:-1, :]
+    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[1:].reshape(-1))
     val_loss += loss.item()
     val_examples += 1
 val_loss /= val_examples
-writer.add_scalar("val/loss", val_loss, step*grad_accum_steps)
+writer.add_scalar("val/loss", val_loss, documents)
 print(f"step: {step} | epoch: {epoch} | loss: {np.mean(losses[-val_every:]):.4f} | val loss {val_loss:.4f} | lr mult: {get_lr(step):.2f} | avg time: {(time.time() - start_time)/(step+1):.3f}s")
 
 

@@ -1,10 +1,9 @@
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
-from flash_attn import flash_attn_func
+from flash_attn import flash_attn_func, flash_attn_varlen_func
 import math
-
-
+from dataclasses import dataclass
 
 
 def norm(x):
@@ -29,10 +28,11 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.down_lin(F.gelu(self.up_lin(x)))
 
-def rotary(x_BTHD: Tensor, cos: Tensor, sin: Tensor):
-    cos = cos[None, :x_BTHD.size(-3), None, :]
-    sin = sin[None, :x_BTHD.size(-3), None, :]
-    x1, x2 = x_BTHD.chunk(2, dim=-1)
+
+def rotary(x_THD: Tensor, cos: Tensor, sin: Tensor):
+    cos = cos[:x_THD.size(-3), None, :]
+    sin = sin[:x_THD.size(-3), None, :]
+    x1, x2 = x_THD.chunk(2, dim=-1)
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat((y1, y2), -1)
@@ -74,6 +74,16 @@ class SliceLinear(nn.Linear):
     def forward(self, x): # can take n_features larger than weight
         return F.linear(x[..., self.slice_start:self.weight.size(-1)+self.slice_start], self.weight.type_as(x), self.bias.type_as(x) if self.bias is not None else None)
 
+
+@dataclass
+class AttnArgs:
+    rope : ROPE
+    cu_seqlens : Tensor
+    max_seqlen : Tensor
+
+#torch.compiler.allow_in_graph(flash_attn_varlen_func)
+flash_attn_varlen_func = torch.compiler.disable(flash_attn_varlen_func)
+
 class CausalAttn(nn.Module):
     def __init__(self, dim, num_heads, window_size = -1):
         super().__init__()
@@ -87,11 +97,14 @@ class CausalAttn(nn.Module):
         self.o_lin.weight.data.zero_()
         self.attn_gate = SliceLinear(20, num_heads)
         
-    def forward(self, x, rope):
-        B, T, D = x.shape
-        q = self.q_lin(x).view(B, T, self.num_heads, self.head_dim)
-        k = self.k_lin(x).view(B, T, self.num_heads, self.head_dim)
-        v = self.v_lin(x).view(B, T, self.num_heads, self.head_dim)
+    def forward(self, x, args : AttnArgs):
+        T, D = x.shape
+        q = self.q_lin(x).view(T, self.num_heads, self.head_dim)
+        k = self.k_lin(x).view(T, self.num_heads, self.head_dim)
+        v = self.v_lin(x).view(T, self.num_heads, self.head_dim)
+
+        rope = args.rope
+        cu_seqlens, max_seqlen = args.cu_seqlens, args.max_seqlen
         
         q, k = rope(q), rope(k)
 
@@ -100,10 +113,14 @@ class CausalAttn(nn.Module):
         #v = v.transpose(1, 2)
         
         #o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        o = flash_attn_func(q, k, v, causal=True, window_size=(self.window_size, 0))
-        o = o * torch.sigmoid(self.attn_gate(x).view(B, T, self.num_heads, 1))
+        o = flash_attn_varlen_func(q, k, v, 
+                                   cu_seqlens, cu_seqlens, 
+                                   max_seqlen, max_seqlen, 
+                                   causal=True, window_size=(self.window_size, 0))
+        #o = flash_attn_func(q, k, v, causal=True, window_size=(self.window_size, 0))
+        o = o * torch.sigmoid(self.attn_gate(x).view(T, self.num_heads, 1))
         #o = o.transpose(1, 2).contiguous()
-        o = o.view(B, T, D)
+        o = o.view(T, D)
         return self.o_lin(o)
 
 class Block(nn.Module):
@@ -114,12 +131,12 @@ class Block(nn.Module):
         self.xs_gate = nn.Parameter(torch.zeros(dim))
         self.x0_gate = nn.Parameter(torch.zeros(dim))
     
-    def forward(self, x, rope, xs = None, x0 = None):
+    def forward(self, x, args, xs = None, x0 = None):
         if xs is not None:
             x = x + xs * self.xs_gate.type_as(xs)
         if x0 is not None:
             x = x + x0 * self.x0_gate.type_as(x0)
-        x = x + self.attn(norm(x), rope)
+        x = x + self.attn(norm(x), args)
         x = x + self.mlp(norm(x))
         return x
 
@@ -147,23 +164,24 @@ class Model(nn.Module):
         #    self.embed.weight.copy_(self.un_embed.weight)
 
 
-    def forward(self, ids, recursion_steps = 1):
+    def forward(self, ids, cu_seqlens, max_seqlen, recursion_steps = 1):
         x0 = self.embed(ids).to(torch.bfloat16)
-        x0 = torch.cat([x0[:, :1], x0[:, 1:] + torch.sigmoid(self.smear_gate(x0[:, 1:])) * self.smear_linear(x0[:, :-1])], dim=1)
+        x0 = torch.cat([x0[:1], x0[1:] + torch.sigmoid(self.smear_gate(x0[1:])) * self.smear_linear(x0[:-1])], dim=0)
         x = x0
         half = len(self.blocks)//2
         ve = [embed(ids).to(torch.bfloat16) for embed in self.value_embeds]
         value_embeds = [None, ve[0], ve[1]] + [ve[2]]*(half-3)
         skip_connections = []
+        attn_args = AttnArgs(self.rope, cu_seqlens, max_seqlen)
         for block, v0 in zip(self.blocks[:half], value_embeds):
             skip_connections.append(x)
-            x = block(x, self.rope, xs=v0, x0=x0)
+            x = block(x, attn_args, xs=v0, x0=x0)
         if len(self.blocks)%2!=0:
             skip_connections.append(None)
         for i in range(recursion_steps):
-            x = self.middle_block(x, self.rope)
+            x = self.middle_block(x, attn_args)
         
         for block, xs in zip(self.blocks[half:], reversed(skip_connections)):
-            x = block(x, self.rope, xs=xs, x0=x0)
+            x = block(x, attn_args, xs=xs, x0=x0)
         x = x + self.end_mlp(norm(x))
         return self.un_embed(norm(x))
