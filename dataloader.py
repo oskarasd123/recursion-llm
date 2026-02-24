@@ -60,6 +60,16 @@ class FineWebDataLoader(IterableDataset):
             token_buffer.extend(tokens)
             lengths.append(len(tokens))
             texts.append(text)
+    
+    def _prepare_batch(self, tokens, lengths):
+        # Create cu_seqlens: [0, len1, len1+len2, ...]
+        cu_seqlens = torch.tensor([0] + torch.cumsum(torch.tensor(lengths), dim=0).tolist(), dtype=torch.int32)
+        
+        return {
+            "input_ids": torch.tensor(tokens, dtype=torch.long),
+            "cu_seqlens": cu_seqlens,
+            "max_seqlen": max(lengths)
+        }
 
 
 class MaxLenFineWebDataLoader(FineWebDataLoader):
@@ -99,15 +109,6 @@ class MaxLenFineWebDataLoader(FineWebDataLoader):
             lengths.append(len(tokens))
             texts.append(text)
     
-    def _prepare_batch(self, tokens, lengths):
-        # Create cu_seqlens: [0, len1, len1+len2, ...]
-        cu_seqlens = torch.tensor([0] + torch.cumsum(torch.tensor(lengths), dim=0).tolist(), dtype=torch.int32)
-        
-        return {
-            "input_ids": torch.tensor(tokens, dtype=torch.long),
-            "cu_seqlens": cu_seqlens,
-            "max_seqlen": max(lengths)
-        }
 
 
 class ValDataset(FineWebDataLoader):

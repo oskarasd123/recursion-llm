@@ -12,24 +12,34 @@ import time
 import math
 from model import Model
 import json
-torch._dynamo.config.capture_scalar_outputs = True
+#torch._dynamo.config.capture_scalar_outputs = True
+#torch.autograd.set_detect_anomaly(True)
 
-
-steps = 5000
+steps = 10000
 val_every = 200
 grad_accum_steps = 16
-log_dir = "runs/simple/25"
+log_dir = "runs/looping/27"
 lr = 1e-2
 load_checkpoint = False
+load_path = "runs/looping/26/checkpoint.pt"
 
 def get_lr(step):
-    # Linear warmup, then cosine decay
+    # Linear warmup, then cosine^2 decay
     warmup_steps = 100
     if step < warmup_steps:
         return (step + 1) / warmup_steps
     progress = (step - warmup_steps) / (steps - warmup_steps)
+    progress = min(progress, 1)
     cos = 0.5 * (1.0 + math.cos(math.pi * progress))
-    return (cos**2) * 0.8 + 0.2
+    return (cos**2) * 0.7 + 0.3
+
+def get_loop_steps(step):
+    if step < 1000:
+        return 1
+    elif step < 3000:
+        return 2
+    else:
+        return 3
 
 torch.set_float32_matmul_precision("high")
 
@@ -76,7 +86,7 @@ for n, p in model.named_parameters():
             adam_parameters.append(p)
         else:
             embed_params.append(p)
-# Use standard Weight Decay
+
 optimizer1 = optim.AdamW(adam_parameters, lr = lr, betas=(0.9, 0.95), weight_decay=0.1)
 optimizer2 = optim.AdamW(embed_params, lr = lr, betas=(0.9, 0.95), weight_decay=0.1)
 optimizer3 = optim.Muon(muon_parameters, lr = lr, momentum=0.8)
@@ -87,7 +97,7 @@ for opt in optimizers:
         group["initial_lr"] = group["lr"]
 
 if load_checkpoint:
-    state_dict = torch.load("checkpoint.pt")
+    state_dict = torch.load(load_path)
     model.load_state_dict(state_dict["model"])
     for i in range(len(optimizers)):
         optimizers[i].load_state_dict(state_dict["optimizers"][i])
@@ -122,6 +132,7 @@ def trace_handler(prof: torch.profiler.profile):
 #    record_shapes=True,
 #)
 
+model.train()
 model.compile()
 model_opt = model
 #model_opt = torch.compile(model, dynamic=False, fullgraph=True)
@@ -129,59 +140,70 @@ model_opt = model
 epoch = 0
 documents = 0
 start_time = time.time()
-for step in range(steps):
-    for opt in optimizers:
-        for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * get_lr(step)
-        
-    loss_accum = 0
-    for i in range(grad_accum_steps):
-        try:
-            batch = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_dataloader)
-            batch = next(train_iter)
-            epoch += 1
+try:
+    for step in range(steps):
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["initial_lr"] * get_lr(step)
             
-        ids = batch["input_ids"].cuda().squeeze(0)
-        cu_seqlens = batch["cu_seqlens"].cuda().squeeze(0)
-        max_seqlen = batch["max_seqlen"].cuda()
-        logits = model_opt(ids, cu_seqlens, max_seqlen)[:-1, :]
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[1:].reshape(-1))
-        loss = loss / grad_accum_steps
-        loss.backward()
-        loss_accum += loss.item()
-        documents += len(batch["texts"])
+        loss_accum = 0
+        for i in range(grad_accum_steps):
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_dataloader)
+                batch = next(train_iter)
+                epoch += 1
+                
+            ids = batch["input_ids"].cuda().squeeze(0)
+            cu_seqlens = batch["cu_seqlens"].cuda().squeeze(0)
+            max_seqlen = batch["max_seqlen"].cuda()
+            logits = model_opt(ids, cu_seqlens, max_seqlen, get_loop_steps(step))[:-1, :]
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[1:].reshape(-1))
+            loss = loss / grad_accum_steps
+            loss.backward()
+            loss_accum += loss.item()
+            documents += len(batch["texts"])
+            
         
+        for opt in optimizers:
+            opt.step()
+        model.zero_grad()
     
-    for opt in optimizers:
-        opt.step()
-    model.zero_grad()
-
-    losses.append(loss_accum)
-    writer.add_scalar("loss", loss_accum, documents)
-    
-    if step % val_every == 0:
-        with torch.no_grad():
-            val_loss = 0
-            val_examples = 0
-            for batch in test_dataloader:
-                ids = batch["input_ids"].cuda().squeeze(0)
-                cu_seqlens = batch["cu_seqlens"].cuda().squeeze(0)
-                max_seqlen = batch["max_seqlen"].cuda()
-                logits = model_opt(ids, cu_seqlens, max_seqlen)[:-1, :]
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[1:].reshape(-1))
-                val_loss += loss.item()
-                val_examples += 1
-            val_loss /= val_examples
-            writer.add_scalar("val/loss", val_loss, documents)
-            print(f"step: {step} | epoch: {epoch} | loss: {np.mean(losses[-val_every:]):.4f} | val loss {val_loss:.4f} | lr mult: {get_lr(step):.2f} | avg time: {(time.time() - start_time)/(step+1):.3f}s")
-    if step == 100:
-        import gc
-        gc.collect()
-        torch.cuda.empty_cache()
-    #prof_ctx.step()
-#prof_ctx.__exit__(None, None, None)
+        losses.append(loss_accum)
+        writer.add_scalar("loss", loss_accum, documents)
+        
+        if step % val_every == 0:
+            with torch.no_grad():
+                val_loss = 0
+                val_examples = 0
+                for batch in test_dataloader:
+                    ids = batch["input_ids"].cuda().squeeze(0)
+                    cu_seqlens = batch["cu_seqlens"].cuda().squeeze(0)
+                    max_seqlen = batch["max_seqlen"].cuda()
+                    logits = model_opt(ids, cu_seqlens, max_seqlen, get_loop_steps(step))[:-1, :]
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[1:].reshape(-1))
+                    val_loss += loss.item()
+                    val_examples += 1
+                val_loss /= val_examples
+                writer.add_scalar("val/loss", val_loss, documents)
+                print(f"step: {step} | epoch: {epoch} | loss: {np.mean(losses[-val_every:]):.4f} | val loss {val_loss:.4f} | lr mult: {get_lr(step):.2f} | avg time: {(time.time() - start_time)/(step+1):.3f}s")
+        if step == 100:
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+        #prof_ctx.step()
+    #prof_ctx.__exit__(None, None, None)
+except KeyboardInterrupt:
+    save = input("save model: ").lower() != "n"
+    if save:
+        state_dict = {
+            "model" : model.state_dict(),
+            "optimizers" : [optimizer.state_dict() for optimizer in optimizers]
+        }
+        torch.save(state_dict, f"{log_dir}/checkpoint.pt")
+        print("model saved")
+    exit()
 
 # final eval
 with torch.no_grad():
@@ -191,7 +213,7 @@ with torch.no_grad():
         ids = batch["input_ids"].cuda().squeeze(0)
         cu_seqlens = batch["cu_seqlens"].cuda().squeeze(0)
         max_seqlen = batch["max_seqlen"].cuda()
-        logits = model_opt(ids, cu_seqlens, max_seqlen)[:-1, :]
+        logits = model_opt(ids, cu_seqlens, max_seqlen, get_loop_steps(step))[:-1, :]
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[1:].reshape(-1))
         val_loss += loss.item()
         val_examples += 1
@@ -207,6 +229,7 @@ state_dict = {
     "optimizers" : [optimizer.state_dict() for optimizer in optimizers]
 }
 torch.save(state_dict, f"{log_dir}/checkpoint.pt")
+print("model saved")
 
 json.dump({
     "hparams": {
@@ -216,7 +239,7 @@ json.dump({
         "window_size" : model.window_size,
     },
     "metrics" : {
-        "avg_loss" : np.mean(losses),
+        "avg_loss" : np.mean(losses[-val_every:]),
         "val_loss" : val_loss,
     }
 }, open(f"{log_dir}/metrics.json", "w"))

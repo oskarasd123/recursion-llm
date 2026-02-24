@@ -152,11 +152,11 @@ class Model(nn.Module):
         self.rope = ROPE(dim//num_heads, 1000, max_seq_len)
         self.un_embed = CastedLinear(dim, num_embeddings, bias=False, dtype=torch.bfloat16)
         self.end_mlp = MLP(dim)
-        self.middle_block = Block(dim, num_heads, window_size*2)
+        self.middle_block = Block(dim, num_heads, window_size*2+1)
         self.value_embeds = nn.ModuleList([ShortEmbedding(num_embeddings, dim, 4) for i in range(3)])
         self.smear_gate = SliceLinear(10, 1, 10)
         self.smear_linear = CastedLinear(dim, dim)
-        
+        self.end_gate = CastedLinear(dim, 1)
         
         # Weight tying (optional but standard and helps convergence)
         self.embed.weight = self.un_embed.weight
@@ -164,24 +164,42 @@ class Model(nn.Module):
         #    self.embed.weight.copy_(self.un_embed.weight)
 
 
-    def forward(self, ids, cu_seqlens, max_seqlen, recursion_steps = 1):
+    def forward(self, ids, cu_seqlens, max_seqlen, loop_steps = 1, return_output_weights = False):
+        assert loop_steps > 0
         x0 = self.embed(ids).to(torch.bfloat16)
         x0 = torch.cat([x0[:1], x0[1:] + torch.sigmoid(self.smear_gate(x0[1:])) * self.smear_linear(x0[:-1])], dim=0)
         x = x0
         half = len(self.blocks)//2
         ve = [embed(ids).to(torch.bfloat16) for embed in self.value_embeds]
         value_embeds = [None, ve[0], ve[1]] + [ve[2]]*(half-3)
-        skip_connections = []
-        attn_args = AttnArgs(self.rope, cu_seqlens, max_seqlen)
-        for block, v0 in zip(self.blocks[:half], value_embeds):
-            skip_connections.append(x)
-            x = block(x, attn_args, xs=v0, x0=x0)
-        if len(self.blocks)%2!=0:
-            skip_connections.append(None)
-        for i in range(recursion_steps):
+        outputs = []
+        end_gates = []
+        for _ in range(loop_steps):
+            skip_connections = []
+            attn_args = AttnArgs(self.rope, cu_seqlens, max_seqlen)
+            for block, v0 in zip(self.blocks[:half], value_embeds):
+                x = block(x, attn_args, xs=v0, x0=x0)
+                skip_connections.append(x)
+            if len(self.blocks)%2!=0:
+                skip_connections.append(None)
             x = self.middle_block(x, attn_args)
+            for block, xs in zip(self.blocks[half:], reversed(skip_connections)):
+                x = block(x, attn_args, xs=xs, x0=x0)
+            o = x + self.end_mlp(norm(x)) # mlp that transforms vectors from thought space into embedding space
+            outputs.append(o)
+            end_gates.append(self.end_gate(x))
         
-        for block, xs in zip(self.blocks[half:], reversed(skip_connections)):
-            x = block(x, attn_args, xs=xs, x0=x0)
-        x = x + self.end_mlp(norm(x))
-        return self.un_embed(norm(x))
+        cum_continue_prob = 1
+        o_weights = [] # weights sum to 1
+        for i, (o, cur_end_prob) in enumerate(zip(outputs, end_gates)):
+            if i == loop_steps-1:
+                cur_end_prob = torch.ones_like(cur_end_prob) # set ending probability to 1
+            current_weight = cur_end_prob * cum_continue_prob
+            o_weights.append(current_weight)
+            cum_continue_prob = cum_continue_prob * 1-cur_end_prob
+
+        outputs = torch._foreach_mul(outputs, o_weights)
+        o = torch.sum(torch.stack(outputs), 0)
+        if return_output_weights:
+            return self.un_embed(norm(o)), o_weights
+        return self.un_embed(norm(o))
