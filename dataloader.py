@@ -60,6 +60,44 @@ class FineWebDataLoader(IterableDataset):
             token_buffer.extend(tokens)
             lengths.append(len(tokens))
             texts.append(text)
+
+
+class MaxLenFineWebDataLoader(FineWebDataLoader):
+    def __iter__(self):
+        protocol = self.dataset.skip(self.num_val_documents)
+        if self.subset != "sample-10BT":
+            protocol = protocol.shuffle(buffer_size=50_000, seed=55)
+        else:
+            protocol = protocol.shuffle(seed=55)
+        
+        token_buffer = []
+        lengths = []
+        texts = []
+        for example in protocol:
+            text = example["text"]
+            # Tokenize the text
+            tokens = self.tokenizer(
+                text,
+                truncation=True,
+                max_length=self.max_length,
+            )["input_ids"]
+            if sum(lengths) + len(tokens) > self.max_length:
+                split_pos = self.max_length-sum(lengths)
+                current = tokens[:split_pos]
+                next = tokens[split_pos:]
+                token_buffer.extend(current)
+                lengths.append(len(current))
+                dict = self._prepare_batch(token_buffer, lengths)
+                dict["texts"] = texts
+                yield dict
+                token_buffer = []
+                lengths = []
+                texts = []
+                tokens = next
+                
+            token_buffer.extend(tokens)
+            lengths.append(len(tokens))
+            texts.append(text)
     
     def _prepare_batch(self, tokens, lengths):
         # Create cu_seqlens: [0, len1, len1+len2, ...]
@@ -70,6 +108,7 @@ class FineWebDataLoader(IterableDataset):
             "cu_seqlens": cu_seqlens,
             "max_seqlen": max(lengths)
         }
+
 
 class ValDataset(FineWebDataLoader):
     def __init__(self, dataset, tokenizer, max_length=8192, subset="sample-10BT"):
@@ -86,18 +125,23 @@ class ValDataset(FineWebDataLoader):
 if __name__ == "__main__":
     from transformers import AutoTokenizer
     import time
+    import numpy as np
     # Load a common tokenizer
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token # GPT2 doesn't have a pad token by default
-    
+    max_len = 8192//2
     # Initialize the dataloader
-    dataloader = FineWebDataLoader(tokenizer, subset="sample-10BT", edu=True, max_length=8192)
+    dataloader = MaxLenFineWebDataLoader(tokenizer, subset="sample-10BT", edu=True, max_length=max_len)
     dataloader = DataLoader(dataloader, 1, num_workers=1)
 
     iterator = iter(dataloader)
-    batch = next(iterator)
-    texts = batch["texts"]
-    ids = batch["input_ids"].squeeze(0)
-    cu_seqlens = batch["cu_seqlens"].squeeze(0)
-    max_seqlen = batch["max_seqlen"]
-    print(ids.shape, cu_seqlens, max_seqlen)
+    filled = []
+    for i in range(256):
+        batch = next(iterator)
+        length = batch["input_ids"].shape[1]
+        fill_frac = length/max_len
+        filled.append(fill_frac)
+    print(f"fill frac: {np.mean(filled)}\n"\
+          f"min filled: {np.min(filled)}"
+          )
+    

@@ -3,7 +3,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 from torch import nn, Tensor, optim
 import torch.nn.functional as F
-from dataloader import FineWebDataLoader
+from dataloader import FineWebDataLoader, MaxLenFineWebDataLoader
 from transformers import AutoTokenizer
 import numpy as np
 from torch.utils.data import DataLoader
@@ -15,10 +15,10 @@ import json
 torch._dynamo.config.capture_scalar_outputs = True
 
 
-steps = 2500
+steps = 5000
 val_every = 200
 grad_accum_steps = 16
-log_dir = "runs/simple/23"
+log_dir = "runs/simple/25"
 lr = 1e-2
 load_checkpoint = False
 
@@ -36,16 +36,16 @@ torch.set_float32_matmul_precision("high")
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
 tokenizer.pad_token = tokenizer.eos_token
 
-dataset = FineWebDataLoader(tokenizer, subset="sample-10BT", edu=True, num_val_documents=500)
+dataset = MaxLenFineWebDataLoader(tokenizer, subset="sample-10BT", edu=True, num_val_documents=500)
 train_dataloader = DataLoader(dataset, batch_size=1, num_workers=1)
 test_dataloader = DataLoader(dataset.val_data, batch_size=1, num_workers=1)
 
 model = Model(
     num_embeddings=len(tokenizer),
-    dim=128*4,
+    dim=128*6,
     num_layers=12,
-    num_heads=4,
-    window_size=128,
+    num_heads=6,
+    window_size=256,
     max_seq_len=8192,
 )
 model.to("cuda")
@@ -162,19 +162,20 @@ for step in range(steps):
     writer.add_scalar("loss", loss_accum, documents)
     
     if step % val_every == 0:
-        val_loss = 0
-        val_examples = 0
-        for batch in test_dataloader:
-            ids = batch["input_ids"].cuda().squeeze(0)
-            cu_seqlens = batch["cu_seqlens"].cuda().squeeze(0)
-            max_seqlen = batch["max_seqlen"].cuda()
-            logits = model_opt(ids, cu_seqlens, max_seqlen)[:-1, :]
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[1:].reshape(-1))
-            val_loss += loss.item()
-            val_examples += 1
-        val_loss /= val_examples
-        writer.add_scalar("val/loss", val_loss, documents)
-        print(f"step: {step} | epoch: {epoch} | loss: {np.mean(losses[-val_every:]):.4f} | val loss {val_loss:.4f} | lr mult: {get_lr(step):.2f} | avg time: {(time.time() - start_time)/(step+1):.3f}s")
+        with torch.no_grad():
+            val_loss = 0
+            val_examples = 0
+            for batch in test_dataloader:
+                ids = batch["input_ids"].cuda().squeeze(0)
+                cu_seqlens = batch["cu_seqlens"].cuda().squeeze(0)
+                max_seqlen = batch["max_seqlen"].cuda()
+                logits = model_opt(ids, cu_seqlens, max_seqlen)[:-1, :]
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[1:].reshape(-1))
+                val_loss += loss.item()
+                val_examples += 1
+            val_loss /= val_examples
+            writer.add_scalar("val/loss", val_loss, documents)
+            print(f"step: {step} | epoch: {epoch} | loss: {np.mean(losses[-val_every:]):.4f} | val loss {val_loss:.4f} | lr mult: {get_lr(step):.2f} | avg time: {(time.time() - start_time)/(step+1):.3f}s")
     if step == 100:
         import gc
         gc.collect()
@@ -183,19 +184,20 @@ for step in range(steps):
 #prof_ctx.__exit__(None, None, None)
 
 # final eval
-val_loss = 0
-val_examples = 0
-for batch in test_dataloader:
-    ids = batch["input_ids"].cuda().squeeze(0)
-    cu_seqlens = batch["cu_seqlens"].cuda().squeeze(0)
-    max_seqlen = batch["max_seqlen"].cuda()
-    logits = model_opt(ids, cu_seqlens, max_seqlen)[:-1, :]
-    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[1:].reshape(-1))
-    val_loss += loss.item()
-    val_examples += 1
-val_loss /= val_examples
-writer.add_scalar("val/loss", val_loss, documents)
-print(f"step: {step} | epoch: {epoch} | loss: {np.mean(losses[-val_every:]):.4f} | val loss {val_loss:.4f} | lr mult: {get_lr(step):.2f} | avg time: {(time.time() - start_time)/(step+1):.3f}s")
+with torch.no_grad():
+    val_loss = 0
+    val_examples = 0
+    for batch in test_dataloader:
+        ids = batch["input_ids"].cuda().squeeze(0)
+        cu_seqlens = batch["cu_seqlens"].cuda().squeeze(0)
+        max_seqlen = batch["max_seqlen"].cuda()
+        logits = model_opt(ids, cu_seqlens, max_seqlen)[:-1, :]
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[1:].reshape(-1))
+        val_loss += loss.item()
+        val_examples += 1
+    val_loss /= val_examples
+    writer.add_scalar("val/loss", val_loss, documents)
+    print(f"step: {step} | epoch: {epoch} | loss: {np.mean(losses[-val_every:]):.4f} | val loss {val_loss:.4f} | lr mult: {get_lr(step):.2f} | avg time: {(time.time() - start_time)/(step+1):.3f}s")
 
 
 
