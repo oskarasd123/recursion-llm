@@ -29,6 +29,7 @@ class FineWebDataLoader(IterableDataset):
         self.num_val_documents = num_val_documents
         self.data_iter = iter(self.dataset)
         self.val_data = ValDataset(self.dataset.take(num_val_documents), tokenizer, max_length, subset)
+        self.val_data.__iter__ = type(self).__iter__
 
 
     def __iter__(self):
@@ -108,6 +109,9 @@ class MaxLenFineWebDataLoader(FineWebDataLoader):
             token_buffer.extend(tokens)
             lengths.append(len(tokens))
             texts.append(text)
+        dict = self._prepare_batch(token_buffer, lengths)
+        dict["texts"] = texts
+        yield dict
     
 
 
@@ -119,7 +123,7 @@ class ValDataset(FineWebDataLoader):
         self.num_val_documents = 0
         self.subset = subset
     
-    def __iter__(self):
+    def __iter__(self): # overriden by FineWebDataLoader
         return FineWebDataLoader.__iter__(self)
 
 # Example Usage:

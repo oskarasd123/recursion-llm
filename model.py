@@ -2,9 +2,7 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from flash_attn import flash_attn_func, flash_attn_varlen_func
-import math
 from dataclasses import dataclass
-
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -17,16 +15,6 @@ class ShortEmbedding(nn.Module):
     
     def forward(self, ids):
         return self.embed_linear(self.embed(ids))
-
-class MLP(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.up_lin = CastedLinear(dim, dim * 4, dtype=torch.bfloat16)
-        self.down_lin = CastedLinear(dim * 4, dim, dtype=torch.bfloat16)
-        self.down_lin.weight.data.zero_()
-    
-    def forward(self, x):
-        return self.down_lin(F.gelu(self.up_lin(x)))
 
 
 def rotary(x_THD: Tensor, cos: Tensor, sin: Tensor):
@@ -74,6 +62,32 @@ class SliceLinear(nn.Linear):
     def forward(self, x): # can take n_features larger than weight
         return F.linear(x[..., self.slice_start:self.weight.size(-1)+self.slice_start], self.weight.type_as(x), self.bias.type_as(x) if self.bias is not None else None)
 
+class GroupedLinear(nn.Linear):
+    def __init__(self, in_features, out_features, groups = 1, *args, **kwargs):
+        assert in_features%groups==0
+        assert out_features%groups==0
+        super().__init__(in_features//groups, out_features, *args, **kwargs)
+        self.weight = self.weight.reshape(groups, in_features//groups, out_features//groups)
+        self.groups = groups
+    
+    def forward(self, x):
+        batch_shape = x.shape[:-1]
+        x = torch.einsum("bnx, nxy -> bny", x.reshape(-1, self.groups, self.in_features), self.weight.type_as(x)).reshape(*batch_shape, -1)
+        if self.bias is not None:
+            x = x + self.bias.type_as(x)
+        return x
+
+class MLP(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        hdim = dim*4
+        self.up_lin = CastedLinear(dim, hdim, dtype=torch.bfloat16)
+        self.down_lin = CastedLinear(hdim, dim, dtype=torch.bfloat16)
+        self.down_lin.weight.data.zero_()
+    
+    def forward(self, x):
+        x = self.up_lin(x)
+        return self.down_lin(F.gelu(x))
 
 @dataclass
 class AttnArgs:
@@ -85,11 +99,14 @@ class AttnArgs:
 flash_attn_varlen_func = torch.compiler.disable(flash_attn_varlen_func)
 
 class CausalAttn(nn.Module):
-    def __init__(self, dim, num_heads, window_size = -1):
+    def __init__(self, dim, num_heads, window_size = -1, pairs = 1):
         super().__init__()
+        assert pairs > 0
+        assert num_heads%pairs==0
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.window_size = window_size
+        self.pairs = torch.tensor(pairs, dtype=torch.int32) # making a tensor prevents compilation errors
         self.q_lin = CastedLinear(dim, dim, dtype=torch.bfloat16)
         self.k_lin = CastedLinear(dim, dim, dtype=torch.bfloat16)
         self.v_lin = CastedLinear(dim, dim, dtype=torch.bfloat16)
@@ -98,35 +115,37 @@ class CausalAttn(nn.Module):
         self.attn_gate = SliceLinear(20, num_heads)
         
     def forward(self, x, args : AttnArgs):
-        T, D = x.shape
-        q = self.q_lin(x).view(T, self.num_heads, self.head_dim)
-        k = self.k_lin(x).view(T, self.num_heads, self.head_dim)
-        v = self.v_lin(x).view(T, self.num_heads, self.head_dim)
+        B, T, D = x.shape
+        assert B == 1
+        q = self.q_lin(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.k_lin(x).view(B, T, self.num_heads, self.head_dim)
+        v = self.v_lin(x).view(B, T, self.num_heads, self.head_dim)
 
         rope = args.rope
         cu_seqlens, max_seqlen = args.cu_seqlens, args.max_seqlen
         
         q, k = rope(q), rope(k)
 
-        #q = q.transpose(1, 2)
-        #k = k.transpose(1, 2)
-        #v = v.transpose(1, 2)
-        
-        #o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        o = flash_attn_varlen_func(q, k, v, 
-                                   cu_seqlens, cu_seqlens, 
-                                   max_seqlen, max_seqlen, 
-                                   causal=True, window_size=(self.window_size, 0))
+        q = self.q_lin(x).view(B, T*self.pairs, self.num_heads//self.pairs, self.head_dim)
+        k = self.k_lin(x).view(B, T*self.pairs, self.num_heads//self.pairs, self.head_dim)
+        v = self.v_lin(x).view(B, T*self.pairs, self.num_heads//self.pairs, self.head_dim)
+        cu_seqlens, max_seqlen = cu_seqlens*self.pairs, max_seqlen*self.pairs
+
+        o = flash_attn_varlen_func(q[0], k[0], v[0], 
+                                cu_seqlens, cu_seqlens, 
+                                max_seqlen, max_seqlen,
+                                causal=True, window_size=(self.window_size, 0))
         #o = flash_attn_func(q, k, v, causal=True, window_size=(self.window_size, 0))
-        o = o * torch.sigmoid(self.attn_gate(x).view(T, self.num_heads, 1))
+        o = o.view(B, T, self.num_heads, self.head_dim)
+        o = o * torch.sigmoid(self.attn_gate(x).view(B, T, self.num_heads, 1))
         #o = o.transpose(1, 2).contiguous()
         o = o.view(T, D)
         return self.o_lin(o)
 
 class Block(nn.Module):
-    def __init__(self, dim, num_heads, window_size=-1):
+    def __init__(self, dim, num_heads, window_size=-1, pairs = 1):
         super().__init__()
-        self.attn = CausalAttn(dim, num_heads, window_size)
+        self.attn = CausalAttn(dim, num_heads, window_size, pairs)
         self.mlp = MLP(dim)
         self.xs_gate = nn.Parameter(torch.zeros(dim))
         self.x0_gate = nn.Parameter(torch.zeros(dim))
@@ -141,31 +160,33 @@ class Block(nn.Module):
         return x
 
 class Model(nn.Module):
-    def __init__(self, num_embeddings, dim, num_layers, num_heads, window_size = -1, max_seq_len = 8192):
+    def __init__(self, num_embeddings, dim, num_layers, num_heads, window_size = -1, pairs = 1, max_seq_len = 8192):
         super().__init__()
         self.dim = dim
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.window_size = window_size
+        self.pairs = pairs
         self.embed = nn.Embedding(num_embeddings, dim)
-        self.blocks = nn.ModuleList([Block(dim, num_heads, window_size) for i in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(dim, num_heads, window_size, (pairs if i%4==1 else 1)) for i in range(num_layers)])
         self.rope = ROPE(dim//num_heads, 1000, max_seq_len)
         self.un_embed = CastedLinear(dim, num_embeddings, bias=False, dtype=torch.bfloat16)
         self.end_mlp = MLP(dim)
-        self.middle_block = Block(dim, num_heads, window_size*2+1)
+        self.middle_block = Block(dim, num_heads, window_size*2, 1)
         self.value_embeds = nn.ModuleList([ShortEmbedding(num_embeddings, dim, 4) for i in range(3)])
         self.smear_gate = SliceLinear(10, 1, 10)
         self.smear_linear = CastedLinear(dim, dim)
         self.end_gate = CastedLinear(dim, 1)
         
-        # Weight tying (optional but standard and helps convergence)
+        # Weight tying improves learning efficiency
         self.embed.weight = self.un_embed.weight
-        #with torch.no_grad():
-        #    self.embed.weight.copy_(self.un_embed.weight)
 
 
-    def forward(self, ids, cu_seqlens, max_seqlen, loop_steps = 1, return_output_weights = False):
+    def forward(self, ids, cu_seqlens = None, max_seqlen = None, loop_steps = 1, return_output_weights = False):
         assert loop_steps > 0
+        if max_seqlen is None or cu_seqlens is None:
+            cu_seqlens = torch.tensor([0, ids.size(1)], dtype=torch.int32, device=ids.device)
+            max_seqlen = torch.tensor([ids.size(1)], dtype=torch.int32, device=ids.device)
         x0 = self.embed(ids).to(torch.bfloat16)
         x0 = torch.cat([x0[:1], x0[1:] + torch.sigmoid(self.smear_gate(x0[1:])) * self.smear_linear(x0[:-1])], dim=0)
         x = x0
@@ -182,7 +203,7 @@ class Model(nn.Module):
                 skip_connections.append(x)
             if len(self.blocks)%2!=0:
                 skip_connections.append(None)
-            x = self.middle_block(x, attn_args)
+            x = self.middle_block(x, attn_args, xs=v0, x0=x0)
             for block, xs in zip(self.blocks[half:], reversed(skip_connections)):
                 x = block(x, attn_args, xs=xs, x0=x0)
             o = x + self.end_mlp(norm(x)) # mlp that transforms vectors from thought space into embedding space
@@ -200,6 +221,16 @@ class Model(nn.Module):
 
         outputs = torch._foreach_mul(outputs, o_weights)
         o = torch.sum(torch.stack(outputs), 0)
+        logits = self.un_embed(norm(o))
         if return_output_weights:
-            return self.un_embed(norm(o)), o_weights
-        return self.un_embed(norm(o))
+            return logits, torch.stack(o_weights, -1)
+        return logits
+
+
+if __name__ == "__main__":
+    #torch._dynamo.config.capture_scalar_outputs = True
+    model = Model(1000, 512, 6, 4, 512).to("cuda")
+    ids = torch.zeros((250), dtype=torch.int32).to("cuda")
+    cu_seqlens = torch.tensor([0, 250], dtype=torch.int32).to("cuda")
+    max_seqlen = torch.tensor(250, dtype=torch.int32).to("cuda")
+    print(torch._dynamo.explain(model)(ids, cu_seqlens, max_seqlen))

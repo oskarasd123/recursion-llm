@@ -2,3 +2,4 @@ __pycache__
 finewebedu10B
 runs
 *.pt
+model_prompts.history
