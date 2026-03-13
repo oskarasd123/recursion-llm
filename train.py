@@ -18,7 +18,7 @@ import json
 steps = 10000
 val_every = 200
 grad_accum_steps = 16
-log_dir = "runs/simple/35"
+log_dir = "runs/simple/39"
 start_lr = 1e-2
 lr = 0.3e-2
 load_checkpoint = False
@@ -36,7 +36,13 @@ def get_lr(step):
     return (cos**3) * (1-end_ratio) + end_ratio
 
 def get_loop_steps(step):
-    return 1
+    if step < 200:
+        return 1
+    if step < 1000:
+        return 2
+    if step < 5000:
+        return 3
+    return 3
 
 torch.set_float32_matmul_precision("high")
 
@@ -49,10 +55,10 @@ test_dataloader = DataLoader(dataset.val_data, batch_size=1, num_workers=1)
 
 model = Model(
     num_embeddings=len(tokenizer),
-    dim=128*6,
+    dim=128*4,
     num_layers=12,
-    num_heads=6,
-    window_size=1024,
+    num_heads=4,
+    window_size=256,
     pairs=1,
     max_seq_len=8192,
 )
@@ -77,7 +83,7 @@ adam_parameters = []
 muon_parameters = []
 embed_params = []
 for n, p in model.named_parameters():
-    if p.ndim == 2 and "embed" not in n:
+    if p.ndim == 2 and "embed" not in n and "gate" not in n:
         muon_parameters.append(p)
     else:
         if "embed" not in n:
@@ -145,7 +151,8 @@ try:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["initial_lr"] * get_lr(step)
-            
+        
+        output_weight_means = []
         loss_accum = 0
         for i in range(grad_accum_steps):
             try:
@@ -158,18 +165,28 @@ try:
             ids = batch["input_ids"].to("cuda", non_blocking=True)
             cu_seqlens = batch["cu_seqlens"].to("cuda", non_blocking=True).squeeze(0)
             max_seqlen = batch["max_seqlen"].to("cuda", non_blocking=True)
-            logits = model_opt(ids, cu_seqlens, max_seqlen, get_loop_steps(step))[:, :-1, :]
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[:, 1:].reshape(-1))
+            logits, output_weights = model_opt(ids, cu_seqlens, max_seqlen, get_loop_steps(step), return_output_weights=True)
+            logits = logits[:, :-1, :]
+            token_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[:, 1:].reshape(-1))
+            output_weight_mean = output_weights.flatten(0,-2).mean(0)
+            output_weight_means.append(output_weight_mean)
+            #gate_regularisation_loss = ((output_weight_mean - output_weight_mean.mean())*2).pow(4).mean() * 0.1
+            output_weight_mean = output_weight_mean * 0.99 + 0.005
+            gate_regularisation_loss = -(torch.log(output_weight_mean) + torch.log(1-output_weight_mean)).mean() # without this term the end gate output would go to 1 and stop learning
+            loss = token_loss + gate_regularisation_loss * 0.01
             loss = loss / grad_accum_steps
             loss.backward()
-            loss_accum += loss.item()
+            loss_accum += token_loss.item() / grad_accum_steps
             documents += len(batch["texts"])
             
         
         for opt in optimizers:
             opt.step()
         model.zero_grad()
-    
+
+        output_weight_means = torch.stack(output_weight_means).to("cpu", torch.float32).mean(0).numpy(force=True)
+        for i, v in enumerate(output_weight_means):
+            writer.add_scalar(f"output_mean/{i}", v, documents)
         losses.append(loss_accum)
         writer.add_scalar("loss", loss_accum, documents)
         

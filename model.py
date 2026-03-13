@@ -126,9 +126,9 @@ class CausalAttn(nn.Module):
         
         q, k = rope(q), rope(k)
 
-        q = self.q_lin(x).view(B, T*self.pairs, self.num_heads//self.pairs, self.head_dim)
-        k = self.k_lin(x).view(B, T*self.pairs, self.num_heads//self.pairs, self.head_dim)
-        v = self.v_lin(x).view(B, T*self.pairs, self.num_heads//self.pairs, self.head_dim)
+        q = q.view(B, T*self.pairs, self.num_heads//self.pairs, self.head_dim)
+        k = k.view(B, T*self.pairs, self.num_heads//self.pairs, self.head_dim)
+        v = v.view(B, T*self.pairs, self.num_heads//self.pairs, self.head_dim)
         cu_seqlens, max_seqlen = cu_seqlens*self.pairs, max_seqlen*self.pairs
 
         o = flash_attn_varlen_func(q[0], k[0], v[0], 
@@ -174,8 +174,8 @@ class Model(nn.Module):
         self.end_mlp = MLP(dim)
         self.middle_block = Block(dim, num_heads, window_size*2, 1)
         self.value_embeds = nn.ModuleList([ShortEmbedding(num_embeddings, dim, 4) for i in range(3)])
-        self.smear_gate = SliceLinear(10, 1, 10)
-        self.smear_linear = CastedLinear(dim, dim)
+        #self.smear_gate = SliceLinear(10, 1, 10)
+        #self.smear_linear = CastedLinear(dim, dim)
         self.end_gate = CastedLinear(dim, 1)
         
         # Weight tying improves learning efficiency
@@ -188,7 +188,7 @@ class Model(nn.Module):
             cu_seqlens = torch.tensor([0, ids.size(1)], dtype=torch.int32, device=ids.device)
             max_seqlen = torch.tensor([ids.size(1)], dtype=torch.int32, device=ids.device)
         x0 = self.embed(ids).to(torch.bfloat16)
-        x0 = torch.cat([x0[:1], x0[1:] + torch.sigmoid(self.smear_gate(x0[1:])) * self.smear_linear(x0[:-1])], dim=0)
+        #x0 = torch.cat([x0[:1], x0[1:] + torch.sigmoid(self.smear_gate(x0[1:])) * self.smear_linear(x0[:-1])], dim=0)
         x = x0
         half = len(self.blocks)//2
         ve = [embed(ids).to(torch.bfloat16) for embed in self.value_embeds]
@@ -208,7 +208,7 @@ class Model(nn.Module):
                 x = block(x, attn_args, xs=xs, x0=x0)
             o = x + self.end_mlp(norm(x)) # mlp that transforms vectors from thought space into embedding space
             outputs.append(o)
-            end_gates.append(self.end_gate(x))
+            end_gates.append(torch.sigmoid(self.end_gate(x)))
         
         cum_continue_prob = 1
         o_weights = [] # weights sum to 1
@@ -217,7 +217,7 @@ class Model(nn.Module):
                 cur_end_prob = torch.ones_like(cur_end_prob) # set ending probability to 1
             current_weight = cur_end_prob * cum_continue_prob
             o_weights.append(current_weight)
-            cum_continue_prob = cum_continue_prob * 1-cur_end_prob
+            cum_continue_prob = cum_continue_prob * (1-cur_end_prob)
 
         outputs = torch._foreach_mul(outputs, o_weights)
         o = torch.sum(torch.stack(outputs), 0)
