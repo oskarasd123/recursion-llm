@@ -17,8 +17,9 @@ import json
 
 steps = 10000
 val_every = 200
-grad_accum_steps = 16
-log_dir = "runs/simple/39"
+grad_accum_steps = 32
+batch_size = 4096
+log_dir = "runs/simple/41"
 start_lr = 1e-2
 lr = 0.3e-2
 load_checkpoint = False
@@ -42,14 +43,16 @@ def get_loop_steps(step):
         return 2
     if step < 5000:
         return 3
-    return 3
+    if step < 8000:
+        return 4
+    return 5
 
 torch.set_float32_matmul_precision("high")
 
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
 tokenizer.pad_token = tokenizer.eos_token
 
-dataset = MaxLenFineWebDataLoader(tokenizer, subset="sample-10BT", edu=True, num_val_documents=500)
+dataset = MaxLenFineWebDataLoader(tokenizer, subset="sample-10BT", edu=True, max_length=batch_size, num_val_documents=500)
 train_dataloader = DataLoader(dataset, batch_size=1, num_workers=1)
 test_dataloader = DataLoader(dataset.val_data, batch_size=1, num_workers=1)
 
@@ -60,7 +63,7 @@ model = Model(
     num_heads=4,
     window_size=256,
     pairs=1,
-    max_seq_len=8192,
+    max_seq_len=batch_size,
 )
 model.to("cuda")
 
@@ -117,7 +120,7 @@ train_iter = iter(train_dataloader)
 #profile_steps = 20
 #
 #def trace_handler(prof: torch.profiler.profile):
-#    prof.export_chrome_trace(f"traces/single-chrome-trace.json.gz")
+#    prof.export_chrome_trace(f"single-chrome-trace.json.gz")
 #
 #prof_ctx = torch.profiler.profile(
 #    activities=[
@@ -172,7 +175,7 @@ try:
             output_weight_means.append(output_weight_mean)
             #gate_regularisation_loss = ((output_weight_mean - output_weight_mean.mean())*2).pow(4).mean() * 0.1
             output_weight_mean = output_weight_mean * 0.99 + 0.005
-            gate_regularisation_loss = -(torch.log(output_weight_mean) + torch.log(1-output_weight_mean)).mean() # without this term the end gate output would go to 1 and stop learning
+            gate_regularisation_loss = -(torch.log(output_weight_mean) + torch.log(1-output_weight_mean)).mean() # without this term the end gate output would go to 0 or 1 and stop learning
             loss = token_loss + gate_regularisation_loss * 0.01
             loss = loss / grad_accum_steps
             loss.backward()
@@ -253,6 +256,8 @@ json.dump({
         "step" : step,
         "documents" : documents,
         "lr" : lr,
+        "batch_size" : batch_size,
+        "grad_accum_steps" : grad_accum_steps,
         "final loop_steps" : get_loop_steps(step),
     },
     "metrics" : {

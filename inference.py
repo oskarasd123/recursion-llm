@@ -15,7 +15,7 @@ import os
 import json
 
 
-model_path = "./runs/simple/35/"
+model_path = "./runs/simple/41/"
 
 
 HISTORY_FILE = "model_prompts.history"
@@ -39,47 +39,50 @@ model = Model(
     num_heads=model_params["num_heads"],
     window_size=model_params["window_size"],
     pairs=model_params.get("pairs", 1),
+    max_seq_len=8192
 )
 
 state_dict = torch.load(f"{model_path}checkpoint.pt")
-model.load_state_dict(state_dict["model"])
+model.load_state_dict(state_dict["model"], strict=False)
 
 model.to("cuda")
+model.eval()
+#model.compile()
 
 prev_prompt = "The sine function"
-while True:
-    text = input("\033[1;32;40m$\033[0;0;0mprompt: ")
-    if text == "r":
-        text = prev_prompt
-    if not text == "c":
-        prev_prompt = text
-        ids = tokenizer(text, return_tensors="pt")["input_ids"].cuda().squeeze(0)
-        new_ids = []
-        print(text, end="")
-    else:
-        print("\033[F", end='') # move cursor to the start of the previous line
-    for i in range(80):
-        logits = model(ids.unsqueeze(0),
-                       loop_steps=hparams.get("final loop_steps", 1),
-        ).squeeze(0)
-        new_id = torch.distributions.Categorical(logits=logits[-1]).sample()
-        ids = torch.cat([ids, new_id.unsqueeze(0)], 0)
-        new_ids.append(new_id.item())
-        if new_id.item() == tokenizer.eos_token_id:
-            print("<eos_token>")
-            break
-        try: 
-            new_text = tokenizer.decode(new_ids).encode().decode() # if the string doesn't contain errors
-            assert "�" not in new_text
-            print(new_text, end="", flush=True)
+try:
+    while True:
+        text = input("\033[1;32;40m$\033[0;0;0mprompt: ")
+        if text == "r":
+            text = prev_prompt
+        if not text == "c":
+            prev_prompt = text
+            ids = tokenizer(text, return_tensors="pt")["input_ids"].cuda().squeeze(0)
             new_ids = []
-        except Exception as e:
-            if len(new_ids) > 4:
-                # print one token
-                token = new_ids.pop(0)
-                print(tokenizer.decode([token]), end="")
-    print()
-    
-    #text = tokenizer.decode(ids)
-    #print(text)
+            print(text, end="")
+        else:
+            print("\033[F", end='') # move cursor to the start of the previous line
+        for i in range(80):
+            logits = model(ids.unsqueeze(0),
+                        loop_steps=hparams.get("final loop_steps", 1),
+            ).squeeze(0)
+            new_id = torch.distributions.Categorical(logits=logits[-1]).sample()
+            ids = torch.cat([ids, new_id.unsqueeze(0)], 0)
+            new_ids.append(new_id.item())
+            if new_id.item() == tokenizer.eos_token_id:
+                print("<eos_token>")
+                break
+            try: 
+                new_text = tokenizer.decode(new_ids).encode().decode() # if the string doesn't contain errors
+                assert "�" not in new_text
+                print(new_text, end="", flush=True)
+                new_ids = []
+            except Exception as e:
+                if len(new_ids) > 4:
+                    # print one token
+                    token = new_ids.pop(0)
+                    print(tokenizer.decode([token]), end="")
+        print()
+except KeyboardInterrupt:
+    print("^C")
 

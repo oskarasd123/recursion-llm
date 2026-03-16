@@ -31,8 +31,8 @@ class ROPE(nn.Module):
         freqs = (1/base) ** torch.linspace(0, 1, dim//2)
         t = torch.arange(max_seq_len)
         theta = torch.outer(t, freqs)
-        self.register_buffer("sin", theta.sin())
-        self.register_buffer("cos", theta.cos())
+        self.register_buffer("sin", theta.sin(), persistent=False)
+        self.register_buffer("cos", theta.cos(), persistent=False)
     
     def forward(self, x):
         return rotary(x, self.cos.type_as(x), self.sin.type_as(x))
@@ -43,8 +43,8 @@ class HalfROPE(nn.Module):
         freqs = (1/base) ** torch.linspace(0, 1, dim//4)
         t = torch.arange(max_seq_len)
         theta = torch.outer(t, freqs)
-        self.register_buffer("sin", theta.sin())
-        self.register_buffer("cos", theta.cos())
+        self.register_buffer("sin", theta.sin(), persistent=False)
+        self.register_buffer("cos", theta.cos(), persistent=False)
     
     def forward(self, x):
         x1, x2 = x.chunk(2, -1)
@@ -114,9 +114,9 @@ class CausalAttn(nn.Module):
         self.o_lin.weight.data.zero_()
         self.attn_gate = SliceLinear(20, num_heads)
         
-    def forward(self, x, args : AttnArgs):
+    def forward(self, x : Tensor, args : AttnArgs):
         B, T, D = x.shape
-        assert B == 1
+        assert B == 1 # varlen_func requires B == 1
         q = self.q_lin(x).view(B, T, self.num_heads, self.head_dim)
         k = self.k_lin(x).view(B, T, self.num_heads, self.head_dim)
         v = self.v_lin(x).view(B, T, self.num_heads, self.head_dim)
