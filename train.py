@@ -19,11 +19,14 @@ steps = 10000
 val_every = 200
 grad_accum_steps = 32
 batch_size = 4096
-log_dir = "runs/simple/41"
 start_lr = 1e-2
 lr = 0.3e-2
-load_checkpoint = False
-load_path = "runs/looping/26/checkpoint.pt"
+
+log_dir = "runs/simple/"
+
+if not os.path.exists(log_dir): os.mkdir(log_dir)
+dir_index = max(list(map(int, os.listdir(log_dir))) + [-1]) + 1 # auto increment
+log_dir = f"{log_dir}{dir_index}/"
 
 def get_lr(step):
     # Linear warmup, then cosine decay
@@ -103,12 +106,6 @@ for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
-if load_checkpoint:
-    state_dict = torch.load(load_path)
-    model.load_state_dict(state_dict["model"])
-    for i in range(len(optimizers)):
-        optimizers[i].load_state_dict(state_dict["optimizers"][i])
-    print("loaded checkpoint")
 
 
 writer = SummaryWriter(log_dir)
