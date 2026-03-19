@@ -96,7 +96,7 @@ class AttnArgs:
     max_seqlen : Tensor
 
 #torch.compiler.allow_in_graph(flash_attn_varlen_func)
-flash_attn_varlen_func = torch.compiler.disable(flash_attn_varlen_func)
+#flash_attn_varlen_func = torch.compiler.disable(flash_attn_varlen_func)
 
 class CausalAttn(nn.Module):
     def __init__(self, dim, num_heads, window_size = -1, pairs = 1):
@@ -106,11 +106,12 @@ class CausalAttn(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.window_size = window_size
-        self.pairs = torch.tensor(pairs, dtype=torch.int32) # making a tensor prevents compilation errors
+
         self.q_lin = CastedLinear(dim, dim, dtype=torch.bfloat16)
         self.k_lin = CastedLinear(dim, dim, dtype=torch.bfloat16)
         self.v_lin = CastedLinear(dim, dim, dtype=torch.bfloat16)
         self.o_lin = CastedLinear(dim, dim, dtype=torch.bfloat16)
+
         self.o_lin.weight.data.zero_()
         self.attn_gate = SliceLinear(20, num_heads)
         
@@ -125,11 +126,6 @@ class CausalAttn(nn.Module):
         cu_seqlens, max_seqlen = args.cu_seqlens, args.max_seqlen
         
         q, k = rope(q), rope(k)
-
-        q = q.view(B, T*self.pairs, self.num_heads//self.pairs, self.head_dim)
-        k = k.view(B, T*self.pairs, self.num_heads//self.pairs, self.head_dim)
-        v = v.view(B, T*self.pairs, self.num_heads//self.pairs, self.head_dim)
-        cu_seqlens, max_seqlen = cu_seqlens*self.pairs, max_seqlen*self.pairs
 
         o = flash_attn_varlen_func(q[0], k[0], v[0], 
                                 cu_seqlens, cu_seqlens, 

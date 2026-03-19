@@ -12,7 +12,7 @@ import time
 import math
 from model import Model
 import json
-#torch._dynamo.config.capture_scalar_outputs = True
+torch._dynamo.config.capture_scalar_outputs = True
 #torch.autograd.set_detect_anomaly(True)
 
 steps = 10000
@@ -133,14 +133,14 @@ train_iter = iter(train_dataloader)
 #    on_trace_ready=trace_handler,
 #    # Records the file and line number for the operation.
 #    # Disabling this mainly to make the traces less cluttered
-#    with_stack=False,
+#    with_stack=True,
 #    record_shapes=True,
 #)
 
 model.train()
-model.compile()
+#model.compile()
 model_opt = model
-#model_opt = torch.compile(model, dynamic=True, fullgraph=True, mode="reduce-overhead")
+model_opt = torch.compile(model, dynamic=True, fullgraph=True)
 #prof_ctx.__enter__()
 epoch = 0
 documents = 0
@@ -165,13 +165,13 @@ try:
                 
             ids = batch["input_ids"].to("cuda", non_blocking=True)
             cu_seqlens = batch["cu_seqlens"].to("cuda", non_blocking=True).squeeze(0)
-            max_seqlen = batch["max_seqlen"].to("cuda", non_blocking=True)
+            max_seqlen = batch["max_seqlen"].item()
             logits, output_weights = model_opt(ids, cu_seqlens, max_seqlen, get_loop_steps(step), return_output_weights=True)
-            logits = logits[:, :-1, :]
-            token_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[:, 1:].reshape(-1))
+
+            token_loss = F.cross_entropy(logits[:, :-1, :].view(-1, logits.size(-1)), ids[:, 1:].reshape(-1))
+
             output_weight_mean = output_weights.flatten(0,-2).mean(0)
             output_weight_means.append(output_weight_mean)
-            #gate_regularisation_loss = ((output_weight_mean - output_weight_mean.mean())*2).pow(4).mean() * 0.1
             output_weight_mean = output_weight_mean * 0.99 + 0.005
             gate_regularisation_loss = -torch.log(output_weight_mean).mean() # without this term the end gate output for the first loop would go to 1 and stop learning
             loss = token_loss + gate_regularisation_loss * 0.01
@@ -198,7 +198,7 @@ try:
                 for batch in test_dataloader:
                     ids = batch["input_ids"].cuda()
                     cu_seqlens = batch["cu_seqlens"].cuda().squeeze(0)
-                    max_seqlen = batch["max_seqlen"].cuda()
+                    max_seqlen = batch["max_seqlen"].item()
                     logits = model_opt(ids, cu_seqlens, max_seqlen, get_loop_steps(step))[:, :-1, :]
                     loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[:, 1:].reshape(-1))
                     val_loss += loss.item()
@@ -223,7 +223,7 @@ with torch.no_grad():
     for batch in test_dataloader:
         ids = batch["input_ids"].cuda()
         cu_seqlens = batch["cu_seqlens"].cuda().squeeze(0)
-        max_seqlen = batch["max_seqlen"].cuda()
+        max_seqlen = batch["max_seqlen"].item()
         logits = model_opt(ids, cu_seqlens, max_seqlen, get_loop_steps(step))[:, :-1, :]
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[:, 1:].reshape(-1))
         val_loss += loss.item()
