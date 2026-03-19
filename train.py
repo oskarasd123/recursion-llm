@@ -40,13 +40,14 @@ def get_lr(step):
     return (cos**3) * (1-end_ratio) + end_ratio
 
 def get_loop_steps(step):
-    if step < 200:
+    frac = step/steps
+    if step < 500:
         return 1
-    if step < 1000:
+    if frac < 0.2:
         return 2
-    if step < 5000:
+    if frac < 0.5:
         return 3
-    if step < 8000:
+    if frac < 0.8:
         return 4
     return 5
 
@@ -172,7 +173,7 @@ try:
             output_weight_means.append(output_weight_mean)
             #gate_regularisation_loss = ((output_weight_mean - output_weight_mean.mean())*2).pow(4).mean() * 0.1
             output_weight_mean = output_weight_mean * 0.99 + 0.005
-            gate_regularisation_loss = -(torch.log(output_weight_mean) + torch.log(1-output_weight_mean)).mean() # without this term the end gate output would go to 0 or 1 and stop learning
+            gate_regularisation_loss = -torch.log(output_weight_mean).mean() # without this term the end gate output for the first loop would go to 1 and stop learning
             loss = token_loss + gate_regularisation_loss * 0.01
             loss = loss / grad_accum_steps
             loss.backward()
@@ -212,7 +213,8 @@ try:
         #prof_ctx.step()
     #prof_ctx.__exit__(None, None, None)
 except KeyboardInterrupt:
-    pass
+    if step < 10:
+        exit()
 
 # final eval
 with torch.no_grad():

@@ -3,3 +3,4 @@ flash_attn
 transformers
 datasets
 readline
+tensorboard
