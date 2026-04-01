@@ -110,10 +110,9 @@ class CausalAttn(nn.Module):
         self.q_lin = CastedLinear(dim, dim, dtype=torch.bfloat16)
         self.k_lin = CastedLinear(dim, dim, dtype=torch.bfloat16)
         self.v_lin = CastedLinear(dim, dim, dtype=torch.bfloat16)
+        self.v_lin.weight.data.zero_()
         self.o_lin = CastedLinear(dim, dim, dtype=torch.bfloat16)
 
-        self.o_lin.weight.data.zero_()
-        self.attn_gate = SliceLinear(20, num_heads)
         
     def forward(self, x : Tensor, args : AttnArgs):
         B, T, D = x.shape
@@ -133,10 +132,10 @@ class CausalAttn(nn.Module):
                                 causal=True, window_size=(self.window_size, 0))
         #o = flash_attn_func(q, k, v, causal=True, window_size=(self.window_size, 0))
         o = o.view(B, T, self.num_heads, self.head_dim)
-        o = o * torch.sigmoid(self.attn_gate(x).view(B, T, self.num_heads, 1))
+        o = o * torch.sigmoid(torch.sum(self.o_lin(o) * q, -1, keepdim=True))
         #o = o.transpose(1, 2).contiguous()
-        o = o.view(T, D)
-        return self.o_lin(o)
+        o = o.view(B, T, D)
+        return o
 
 class Block(nn.Module):
     def __init__(self, dim, num_heads, window_size=-1, pairs = 1):
@@ -182,7 +181,7 @@ class Model(nn.Module):
         assert loop_steps > 0
         if max_seqlen is None or cu_seqlens is None:
             cu_seqlens = torch.tensor([0, ids.size(1)], dtype=torch.int32, device=ids.device)
-            max_seqlen = torch.tensor([ids.size(1)], dtype=torch.int32, device=ids.device)
+            max_seqlen = ids.size(1)
         x0 = self.embed(ids).to(torch.bfloat16)
         #x0 = torch.cat([x0[:1], x0[1:] + torch.sigmoid(self.smear_gate(x0[1:])) * self.smear_linear(x0[:-1])], dim=0)
         x = x0

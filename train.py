@@ -17,23 +17,26 @@ torch._dynamo.config.capture_scalar_outputs = True
 
 steps = 10000
 val_every = 200
-grad_accum_steps = 32
-batch_size = 4096
+grad_accum_steps = 16
+batch_size = 8192
 start_lr = 1e-2
 lr = 0.3e-2
+load_checkpoint = False
 
-log_dir = "runs/simple/"
+log_dir = "runs/"
 
-if not os.path.exists(log_dir): os.mkdir(log_dir)
-dir_index = max(list(map(int, os.listdir(log_dir))) + [-1]) + 1 # auto increment
+if not os.path.exists(log_dir):
+    os.mkdir(log_dir)
+dir_index = max(list(map(int, os.listdir(log_dir))) + [-1]) + (0 if load_checkpoint else 1) # auto increment
 log_dir = f"{log_dir}{dir_index}/"
 
 def get_lr(step):
     # Linear warmup, then cosine decay
     warmup_steps = 100
+    schedule_steps = 10000
     if step < warmup_steps:
         return (step + 1) / warmup_steps
-    progress = (step - warmup_steps) / (steps - warmup_steps)
+    progress = (step - warmup_steps) / (schedule_steps - warmup_steps)
     progress = max(min(progress, 1), 0)
     cos = 0.5 * (1.0 + math.cos(math.pi * progress))
     end_ratio = lr/start_lr
@@ -41,22 +44,14 @@ def get_lr(step):
 
 def get_loop_steps(step):
     frac = step/steps
-    if step < 500:
-        return 1
-    if frac < 0.2:
-        return 2
-    if frac < 0.5:
-        return 3
-    if frac < 0.8:
-        return 4
-    return 5
+    return 1
 
 torch.set_float32_matmul_precision("high")
 
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
 tokenizer.pad_token = tokenizer.eos_token
 
-dataset = MaxLenFineWebDataLoader(tokenizer, subset="sample-10BT", edu=True, max_length=batch_size, num_val_documents=500)
+dataset = MaxLenFineWebDataLoader(tokenizer, subset="sample-10BT", edu=True, max_length=batch_size, num_val_documents=10000)
 train_dataloader = DataLoader(dataset, batch_size=1, num_workers=1)
 test_dataloader = DataLoader(dataset.val_data, batch_size=1, num_workers=1)
 
@@ -65,7 +60,7 @@ model = Model(
     dim=128*4,
     num_layers=12,
     num_heads=4,
-    window_size=256,
+    window_size=512,
     pairs=1,
     max_seq_len=batch_size,
 )
@@ -100,7 +95,8 @@ for n, p in model.named_parameters():
 
 optimizer1 = optim.AdamW(adam_parameters, lr = start_lr, betas=(0.9, 0.95), weight_decay=0.1, fused=True)
 optimizer2 = optim.AdamW(embed_params, lr = start_lr, betas=(0.9, 0.95), weight_decay=0.1, fused=True)
-optimizer3 = optim.Muon(muon_parameters, lr = start_lr, momentum=0.8)
+#optimizer3 = optim.Muon(muon_parameters, lr = start_lr, momentum=0.8)
+optimizer3 = optim.AdamW(muon_parameters, lr = start_lr, betas=(0.9, 0.95)) # no muon in torch==2.8.0
 optimizers = [optimizer1, optimizer2, optimizer3]
 
 for opt in optimizers:
@@ -140,13 +136,24 @@ train_iter = iter(train_dataloader)
 model.train()
 #model.compile()
 model_opt = model
-model_opt = torch.compile(model, dynamic=True, fullgraph=True)
+model_opt = torch.compile(model, dynamic=True)
 #prof_ctx.__enter__()
 epoch = 0
 documents = 0
+step = 0
+
+if load_checkpoint:
+    state_dict = torch.load(f"{log_dir}/checkpoint.pt")
+    model.load_state_dict(state_dict["model"])
+    for opt, state in zip(optimizers, state_dict["optimizers"]):
+        opt.load_state_dict(state)
+    metrics = json.load(open(f"{log_dir}/metrics.json", "r"))
+    step = metrics["hparams"]["step"]
+    documents = metrics["hparams"]["documents"]
+
 start_time = time.time()
 try:
-    for step in range(steps):
+    for step in range(step, steps):
         if step == 1: # first step takes more time because of compilation
             start_time = time.time() # set start time after 1st step
         for opt in optimizers:
@@ -172,9 +179,9 @@ try:
 
             output_weight_mean = output_weights.flatten(0,-2).mean(0)
             output_weight_means.append(output_weight_mean)
-            output_weight_mean = output_weight_mean * 0.99 + 0.005
+            output_weight_mean = output_weight_mean * 0.999 + 0.0005
             gate_regularisation_loss = -torch.log(output_weight_mean).mean() # without this term the end gate output for the first loop would go to 1 and stop learning
-            loss = token_loss + gate_regularisation_loss * 0.01
+            loss = token_loss + gate_regularisation_loss * 0.005
             loss = loss / grad_accum_steps
             loss.backward()
             loss_accum += token_loss.item() / grad_accum_steps
@@ -206,33 +213,16 @@ try:
                 val_loss /= val_examples
                 writer.add_scalar("val/loss", val_loss, documents)
                 print(f"step: {step} | epoch: {epoch} | loss: {np.mean(losses[-val_every:]):.4f} | val loss {val_loss:.4f} | lr mult: {get_lr(step):.2f} | avg step time: {(time.time() - start_time)/(step+1):.3f}s")
-        if step == 100:
-            import gc
-            gc.collect()
-            torch.cuda.empty_cache()
         #prof_ctx.step()
     #prof_ctx.__exit__(None, None, None)
 except KeyboardInterrupt:
     if step < 10:
         exit()
-
-# final eval
-with torch.no_grad():
-    val_loss = 0
-    val_examples = 0
-    for batch in test_dataloader:
-        ids = batch["input_ids"].cuda()
-        cu_seqlens = batch["cu_seqlens"].cuda().squeeze(0)
-        max_seqlen = batch["max_seqlen"].item()
-        logits = model_opt(ids, cu_seqlens, max_seqlen, get_loop_steps(step))[:, :-1, :]
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[:, 1:].reshape(-1))
-        val_loss += loss.item()
-        val_examples += 1
-    val_loss /= val_examples
-    writer.add_scalar("val/loss", val_loss, documents)
-    print(f"step: {step} | epoch: {epoch} | loss: {np.mean(losses[-val_every:]):.4f} | val loss {val_loss:.4f} | lr mult: {get_lr(step):.2f} | avg time: {(time.time() - start_time)/(step+1):.3f}s")
-
-
+except torch.OutOfMemoryError as e:
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    print(e)
 
 
 state_dict = {

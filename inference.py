@@ -13,9 +13,9 @@ import readline
 import atexit
 import os
 import json
+torch._dynamo.config.capture_scalar_outputs = True
 
-
-model_path = "./runs/simple/41/"
+model_path = "./runs/8/"
 
 
 HISTORY_FILE = "model_prompts.history"
@@ -41,20 +41,44 @@ model = Model(
     pairs=model_params.get("pairs", 1),
     max_seq_len=8192
 )
-
-state_dict = torch.load(f"{model_path}checkpoint.pt")
+state_dict = torch.load(f"{model_path}checkpoint.pt", mmap=True)
 model.load_state_dict(state_dict["model"], strict=False)
+
+
+print(hparams)
+
+model_numel = 0
+embed_numel = 0
+model_size = 0
+for n, p in model.named_parameters():
+    if "embed" in n:
+        embed_numel += p.numel()
+    else:
+        model_numel += p.numel()
+    model_size += p.numel() * p.element_size()
+print(f"model numel: {model_numel/1000_000:.1f}M")
+print(f"embed numel: {embed_numel/1000_000:.1f}M")
+print(f"model size in bytes: {model_size/1024**2:.1f}MiB")
+
+
+
 
 model.to("cuda")
 model.eval()
-#model.compile()
+model_opt = model
+#model_opt = torch.compile(model, dynamic=True)
 
-prev_prompt = "The sine function"
+
 try:
     while True:
         text = input("\033[1;32;40m$\033[0;0;0mprompt: ")
-        if text == "r":
-            text = prev_prompt
+        loop_steps = hparams.get("final loop_steps", 1)
+        if "%" in text:
+            try:
+                loop_steps = int(text.split("%")[0])
+                text = text.split("%")[1]
+            except:
+                pass
         if not text == "c":
             prev_prompt = text
             ids = tokenizer(text, return_tensors="pt")["input_ids"].cuda().squeeze(0)
@@ -63,8 +87,8 @@ try:
         else:
             print("\033[F", end='') # move cursor to the start of the previous line
         for i in range(80):
-            logits = model(ids.unsqueeze(0),
-                        loop_steps=hparams.get("final loop_steps", 1),
+            logits = model_opt(ids.unsqueeze(0),
+                        loop_steps=loop_steps,
             ).squeeze(0)
             new_id = torch.distributions.Categorical(logits=logits[-1]).sample()
             ids = torch.cat([ids, new_id.unsqueeze(0)], 0)
@@ -85,4 +109,6 @@ try:
         print()
 except KeyboardInterrupt:
     print("^C")
+except EOFError:
+    print("^D")
 
