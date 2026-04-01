@@ -111,7 +111,7 @@ class CausalAttn(nn.Module):
         self.k_lin = CastedLinear(dim, dim, dtype=torch.bfloat16)
         self.v_lin = CastedLinear(dim, dim, dtype=torch.bfloat16)
         self.v_lin.weight.data.zero_()
-        self.o_lin = CastedLinear(dim, dim, dtype=torch.bfloat16)
+        self.o_lin = CastedLinear(self.head_dim, self.head_dim, dtype=torch.bfloat16)
 
         
     def forward(self, x : Tensor, args : AttnArgs):
