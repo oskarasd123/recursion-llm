@@ -38,7 +38,6 @@ model = Model(
     num_layers=model_params["num_layers"],
     num_heads=model_params["num_heads"],
     window_size=model_params["window_size"],
-    pairs=model_params.get("pairs", 1),
     max_seq_len=8192
 )
 state_dict = torch.load(f"{model_path}checkpoint.pt", mmap=True)

@@ -1,0 +1,7 @@
+.git
+runs
+traces
+__pycache__
+finewebedu10B
+*.pt
+model_prompts.history

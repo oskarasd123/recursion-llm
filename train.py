@@ -3,6 +3,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 from torch import nn, Tensor, optim
 import torch.nn.functional as F
+import muon # no muon in torch==2.8.0
 from dataloader import FineWebDataLoader, MaxLenFineWebDataLoader
 from transformers import AutoTokenizer
 import numpy as np
@@ -16,12 +17,13 @@ torch._dynamo.config.capture_scalar_outputs = True
 #torch.autograd.set_detect_anomaly(True)
 
 steps = 10000
-val_every = 200
-grad_accum_steps = 16
-batch_size = 8192
+grad_accum_steps = 32
+batch_size = 4096
 start_lr = 1e-2
 lr = 0.3e-2
 load_checkpoint = False
+val_every = 200
+validate = False
 
 log_dir = "runs/"
 
@@ -44,7 +46,7 @@ def get_lr(step):
 
 def get_loop_steps(step):
     frac = step/steps
-    return 1
+    return 4
 
 torch.set_float32_matmul_precision("high")
 
@@ -60,8 +62,7 @@ model = Model(
     dim=128*4,
     num_layers=12,
     num_heads=4,
-    window_size=512,
-    pairs=1,
+    window_size=256,
     max_seq_len=batch_size,
 )
 model.to("cuda")
@@ -95,8 +96,7 @@ for n, p in model.named_parameters():
 
 optimizer1 = optim.AdamW(adam_parameters, lr = start_lr, betas=(0.9, 0.95), weight_decay=0.1, fused=True)
 optimizer2 = optim.AdamW(embed_params, lr = start_lr, betas=(0.9, 0.95), weight_decay=0.1, fused=True)
-#optimizer3 = optim.Muon(muon_parameters, lr = start_lr, momentum=0.8)
-optimizer3 = optim.AdamW(muon_parameters, lr = start_lr, betas=(0.9, 0.95)) # no muon in torch==2.8.0
+optimizer3 = muon.Muon(muon_parameters, lr = start_lr, momentum=0.8)
 optimizers = [optimizer1, optimizer2, optimizer3]
 
 for opt in optimizers:
@@ -104,11 +104,6 @@ for opt in optimizers:
         group["initial_lr"] = group["lr"]
 
 
-
-writer = SummaryWriter(log_dir)
-start_time = time.time()
-losses = []
-train_iter = iter(train_dataloader)
 
 
 #profile_steps = 20
@@ -132,6 +127,11 @@ train_iter = iter(train_dataloader)
 #    with_stack=True,
 #    record_shapes=True,
 #)
+
+
+writer = SummaryWriter(log_dir)
+losses = []
+train_iter = iter(train_dataloader)
 
 model.train()
 #model.compile()
@@ -202,16 +202,17 @@ try:
             with torch.no_grad():
                 val_loss = 0
                 val_examples = 0
-                for batch in test_dataloader:
-                    ids = batch["input_ids"].cuda()
-                    cu_seqlens = batch["cu_seqlens"].cuda().squeeze(0)
-                    max_seqlen = batch["max_seqlen"].item()
-                    logits = model_opt(ids, cu_seqlens, max_seqlen, get_loop_steps(step))[:, :-1, :]
-                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[:, 1:].reshape(-1))
-                    val_loss += loss.item()
-                    val_examples += 1
-                val_loss /= val_examples
-                writer.add_scalar("val/loss", val_loss, documents)
+                if validate:
+                    for batch in test_dataloader:
+                        ids = batch["input_ids"].cuda()
+                        cu_seqlens = batch["cu_seqlens"].cuda().squeeze(0)
+                        max_seqlen = batch["max_seqlen"].item()
+                        logits = model_opt(ids, cu_seqlens, max_seqlen, get_loop_steps(step))[:, :-1, :]
+                        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[:, 1:].reshape(-1))
+                        val_loss += loss.item()
+                        val_examples += 1
+                    val_loss /= val_examples
+                    writer.add_scalar("val/loss", val_loss, documents)
                 print(f"step: {step} | epoch: {epoch} | loss: {np.mean(losses[-val_every:]):.4f} | val loss {val_loss:.4f} | lr mult: {get_lr(step):.2f} | avg step time: {(time.time() - start_time)/(step+1):.3f}s")
         #prof_ctx.step()
     #prof_ctx.__exit__(None, None, None)
@@ -238,8 +239,7 @@ json.dump({
             "num_layers" : model.num_layers,
             "dim" : model.dim,
             "num_heads" : model.num_heads,
-            "window_size" : model.window_size,
-            "pairs" : model.pairs,
+            "window_size" : model.window_size
         },
         "steps" : steps,
         "step" : step,
