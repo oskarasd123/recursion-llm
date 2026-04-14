@@ -1,5 +1,6 @@
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' # supress tensorflow warnings
 import torch
 from torch import nn, Tensor, optim
 import torch.nn.functional as F
@@ -16,23 +17,19 @@ import json
 torch._dynamo.config.capture_scalar_outputs = True
 #torch.autograd.set_detect_anomaly(True)
 
-steps = 10000
-grad_accum_steps = 32
-batch_size = 4096
-start_lr = 1e-2
-lr = 0.3e-2
+# most hparams are here
+steps = 6000
+base_grad_accum_steps = 16
+batch_size = 8192
+start_lr = 0.5e-2
+lr = 0.2e-2
 load_checkpoint = False
 val_every = 200
-validate = False
+validate = True
 
 log_dir = "runs/"
 
-if not os.path.exists(log_dir):
-    os.mkdir(log_dir)
-dir_index = max(list(map(int, os.listdir(log_dir))) + [-1]) + (0 if load_checkpoint else 1) # auto increment
-log_dir = f"{log_dir}{dir_index}/"
-
-def get_lr(step):
+def get_lr(step): # learning rate multiplier applied on start_lr
     # Linear warmup, then cosine decay
     warmup_steps = 100
     schedule_steps = 10000
@@ -46,7 +43,22 @@ def get_lr(step):
 
 def get_loop_steps(step):
     frac = step/steps
-    return 4
+    return 1
+
+def get_grad_accum_steps(step):
+    return base_grad_accum_steps
+    if step < 2000:
+        return base_grad_accum_steps
+    if step < 3000:
+        return base_grad_accum_steps*2
+    return base_grad_accum_steps*4
+
+if not os.path.exists(log_dir):
+    os.mkdir(log_dir)
+# auto increment log_dir
+dir_index = max(list(map(int, os.listdir(log_dir))) + [-1]) + (0 if load_checkpoint else 1)
+log_dir = f"{log_dir}{dir_index}/"
+
 
 torch.set_float32_matmul_precision("high")
 
@@ -54,8 +66,9 @@ tokenizer = AutoTokenizer.from_pretrained("gpt2")
 tokenizer.pad_token = tokenizer.eos_token
 
 dataset = MaxLenFineWebDataLoader(tokenizer, subset="sample-10BT", edu=True, max_length=batch_size, num_val_documents=10000)
+val_dataset = MaxLenFineWebDataLoader(tokenizer, subset="sample-10BT", edu=True, max_length=batch_size, num_val_documents=10000, val=True)
 train_dataloader = DataLoader(dataset, batch_size=1, num_workers=1)
-test_dataloader = DataLoader(dataset.val_data, batch_size=1, num_workers=1)
+test_dataloader = DataLoader(val_dataset, batch_size=1, num_workers=1)
 
 model = Model(
     num_embeddings=len(tokenizer),
@@ -151,15 +164,45 @@ if load_checkpoint:
     step = metrics["hparams"]["step"]
     documents = metrics["hparams"]["documents"]
 
+def save_model():
+    state_dict = {
+        "model" : model.state_dict(),
+        "optimizers" : [optimizer.state_dict() for optimizer in optimizers]
+    }
+    torch.save(state_dict, f"{log_dir}/checkpoint.pt")
+    #print("model saved")
+
+    json.dump({
+        "hparams": {
+            "model params":{
+                "num_layers" : model.num_layers,
+                "dim" : model.dim,
+                "num_heads" : model.num_heads,
+                "window_size" : model.window_size
+            },
+            "steps" : steps,
+            "step" : step,
+            "documents" : documents,
+            "lr" : lr,
+            "batch_size" : batch_size,
+            "grad_accum_steps" : grad_accum_steps,
+            "final loop_steps" : get_loop_steps(step),
+        },
+        "metrics" : {
+            "avg_loss" : np.mean(losses[-val_every:]),
+            "val_loss" : val_loss,
+        }
+    }, open(f"{log_dir}/metrics.json", "w"))
+
 start_time = time.time()
 try:
     for step in range(step, steps):
         if step == 1: # first step takes more time because of compilation
             start_time = time.time() # set start time after 1st step
+        grad_accum_steps = get_grad_accum_steps(step)
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["initial_lr"] * get_lr(step)
-        
         output_weight_means = []
         loss_accum = 0
         for i in range(grad_accum_steps):
@@ -184,7 +227,7 @@ try:
             loss = token_loss + gate_regularisation_loss * 0.005
             loss = loss / grad_accum_steps
             loss.backward()
-            loss_accum += token_loss.item() / grad_accum_steps
+            loss_accum += token_loss / grad_accum_steps
             documents += len(batch["texts"])
             
         
@@ -195,25 +238,26 @@ try:
         output_weight_means = torch.stack(output_weight_means).to("cpu", torch.float32).mean(0).numpy(force=True)
         for i, v in enumerate(output_weight_means):
             writer.add_scalar(f"output_mean/{i}", v, documents)
-        losses.append(loss_accum)
-        writer.add_scalar("loss", loss_accum, documents)
+        losses.append(loss_accum.item())
+        writer.add_scalar("loss", loss_accum.item(), documents)
         
         if step % val_every == 0:
-            with torch.no_grad():
-                val_loss = 0
-                val_examples = 0
-                if validate:
+            if validate:
+                with torch.no_grad():
+                    val_loss = 0
+                    val_examples = 0
                     for batch in test_dataloader:
-                        ids = batch["input_ids"].cuda()
-                        cu_seqlens = batch["cu_seqlens"].cuda().squeeze(0)
+                        ids = batch["input_ids"].to("cuda", non_blocking=True)
+                        cu_seqlens = batch["cu_seqlens"].to("cuda", non_blocking=True).squeeze(0)
                         max_seqlen = batch["max_seqlen"].item()
-                        logits = model_opt(ids, cu_seqlens, max_seqlen, get_loop_steps(step))[:, :-1, :]
-                        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), ids[:, 1:].reshape(-1))
-                        val_loss += loss.item()
+                        logits = model_opt(ids, cu_seqlens, max_seqlen, get_loop_steps(step))
+                        loss = F.cross_entropy(logits[:, :-1, :].view(-1, logits.size(-1)), ids[:, 1:].reshape(-1))
+                        val_loss += loss
                         val_examples += 1
-                    val_loss /= val_examples
+                    val_loss = val_loss.item() / val_examples
                     writer.add_scalar("val/loss", val_loss, documents)
-                print(f"step: {step} | epoch: {epoch} | loss: {np.mean(losses[-val_every:]):.4f} | val loss {val_loss:.4f} | lr mult: {get_lr(step):.2f} | avg step time: {(time.time() - start_time)/(step+1):.3f}s")
+            print(f"step: {step} | epoch: {epoch} | loss: {np.mean(losses[-val_every:]):.4f} | val loss {val_loss:.4f} | lr mult: {get_lr(step):.2f} | avg step time: {(time.time() - start_time)/(step+1):.3f}s | train documents: {documents}")
+            save_model()
         #prof_ctx.step()
     #prof_ctx.__exit__(None, None, None)
 except KeyboardInterrupt:
@@ -224,33 +268,4 @@ except torch.OutOfMemoryError as e:
     gc.collect()
     torch.cuda.empty_cache()
     print(e)
-
-
-state_dict = {
-    "model" : model.state_dict(),
-    "optimizers" : [optimizer.state_dict() for optimizer in optimizers]
-}
-torch.save(state_dict, f"{log_dir}/checkpoint.pt")
-print("model saved")
-
-json.dump({
-    "hparams": {
-        "model params":{
-            "num_layers" : model.num_layers,
-            "dim" : model.dim,
-            "num_heads" : model.num_heads,
-            "window_size" : model.window_size
-        },
-        "steps" : steps,
-        "step" : step,
-        "documents" : documents,
-        "lr" : lr,
-        "batch_size" : batch_size,
-        "grad_accum_steps" : grad_accum_steps,
-        "final loop_steps" : get_loop_steps(step),
-    },
-    "metrics" : {
-        "avg_loss" : np.mean(losses[-val_every:]),
-        "val_loss" : val_loss,
-    }
-}, open(f"{log_dir}/metrics.json", "w"))
+save_model()
