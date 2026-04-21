@@ -6,6 +6,7 @@ from torch import nn, Tensor, optim
 import torch.nn.functional as F
 import muon # no muon in torch==2.8.0
 from dataloader import FineWebDataLoader, MaxLenFineWebDataLoader
+from tokenizer_compressor import create_token_compression_map
 from transformers import AutoTokenizer
 import numpy as np
 from torch.utils.data import DataLoader
@@ -18,14 +19,14 @@ torch._dynamo.config.capture_scalar_outputs = True
 #torch.autograd.set_detect_anomaly(True)
 
 # most hparams are here
-steps = 6000
-base_grad_accum_steps = 16
-batch_size = 8192
+steps = 100
+base_grad_accum_steps = 32
+batch_size = 4096
 start_lr = 0.5e-2
 lr = 0.2e-2
 load_checkpoint = False
 val_every = 200
-validate = True
+validate = False
 
 log_dir = "runs/"
 
@@ -77,8 +78,7 @@ model = Model(
     num_heads=4,
     window_size=256,
     max_seq_len=batch_size,
-)
-model.to("cuda")
+).to("cuda")
 
 model_numel = 0
 embed_numel = 0
@@ -110,6 +110,7 @@ for n, p in model.named_parameters():
 optimizer1 = optim.AdamW(adam_parameters, lr = start_lr, betas=(0.9, 0.95), weight_decay=0.1, fused=True)
 optimizer2 = optim.AdamW(embed_params, lr = start_lr, betas=(0.9, 0.95), weight_decay=0.1, fused=True)
 optimizer3 = muon.Muon(muon_parameters, lr = start_lr, momentum=0.8)
+#optimizer4 = optim.Adam(engram_params, lr = start_lr*0.1, betas=(0.9, 0.999), weight_decay=0)
 optimizers = [optimizer1, optimizer2, optimizer3]
 
 for opt in optimizers:
@@ -119,8 +120,6 @@ for opt in optimizers:
 
 
 
-#profile_steps = 20
-#
 #def trace_handler(prof: torch.profiler.profile):
 #    prof.export_chrome_trace(f"single-chrome-trace.json.gz")
 #
@@ -130,13 +129,8 @@ for opt in optimizers:
 #        torch.profiler.ProfilerActivity.CPU,
 #        torch.profiler.ProfilerActivity.CUDA,
 #    ],
-#    # Setup the profiler schedule to wait 5 steps, warmup for 5 steps,
-#    # then activate for the remaining steps.
-#    schedule=torch.profiler.schedule(wait=10, warmup=5, active=profile_steps - 15),
-#    # This callback will be fired when the trace files are ready
+#    schedule=torch.profiler.schedule(wait=10, warmup=5, active=5),
 #    on_trace_ready=trace_handler,
-#    # Records the file and line number for the operation.
-#    # Disabling this mainly to make the traces less cluttered
 #    with_stack=True,
 #    record_shapes=True,
 #)
@@ -146,10 +140,10 @@ writer = SummaryWriter(log_dir)
 losses = []
 train_iter = iter(train_dataloader)
 
-model.train()
+
 #model.compile()
 model_opt = model
-model_opt = torch.compile(model, dynamic=True)
+#model_opt = torch.compile(model, dynamic=True)
 #prof_ctx.__enter__()
 epoch = 0
 documents = 0
@@ -216,18 +210,18 @@ try:
             ids = batch["input_ids"].to("cuda", non_blocking=True)
             cu_seqlens = batch["cu_seqlens"].to("cuda", non_blocking=True).squeeze(0)
             max_seqlen = batch["max_seqlen"].item()
-            logits, output_weights = model_opt(ids, cu_seqlens, max_seqlen, get_loop_steps(step), return_output_weights=True)
+            logits, output_weights = model_opt(ids, cu_seqlens = cu_seqlens, max_seqlen = max_seqlen, loop_steps=get_loop_steps(step), return_output_weights=True)
 
             token_loss = F.cross_entropy(logits[:, :-1, :].view(-1, logits.size(-1)), ids[:, 1:].reshape(-1))
 
             output_weight_mean = output_weights.flatten(0,-2).mean(0)
-            output_weight_means.append(output_weight_mean)
             output_weight_mean = output_weight_mean * 0.999 + 0.0005
             gate_regularisation_loss = -torch.log(output_weight_mean).mean() # without this term the end gate output for the first loop would go to 1 and stop learning
             loss = token_loss + gate_regularisation_loss * 0.005
             loss = loss / grad_accum_steps
             loss.backward()
-            loss_accum += token_loss / grad_accum_steps
+            output_weight_means.append(output_weight_mean.to(torch.float32).numpy(force=True))
+            loss_accum += token_loss.item() / grad_accum_steps
             documents += len(batch["texts"])
             
         
@@ -235,26 +229,26 @@ try:
             opt.step()
         model.zero_grad()
 
-        output_weight_means = torch.stack(output_weight_means).to("cpu", torch.float32).mean(0).numpy(force=True)
+        output_weight_means = np.mean(output_weight_means, axis=0)
         for i, v in enumerate(output_weight_means):
             writer.add_scalar(f"output_mean/{i}", v, documents)
-        losses.append(loss_accum.item())
-        writer.add_scalar("loss", loss_accum.item(), documents)
+        losses.append(loss_accum)
+        writer.add_scalar("loss", loss_accum, documents)
         
         if step % val_every == 0:
+            val_loss = 0
+            val_examples = 0
             if validate:
                 with torch.no_grad():
-                    val_loss = 0
-                    val_examples = 0
                     for batch in test_dataloader:
                         ids = batch["input_ids"].to("cuda", non_blocking=True)
                         cu_seqlens = batch["cu_seqlens"].to("cuda", non_blocking=True).squeeze(0)
                         max_seqlen = batch["max_seqlen"].item()
-                        logits = model_opt(ids, cu_seqlens, max_seqlen, get_loop_steps(step))
+                        logits, output_weights = model_opt(ids, cu_seqlens = cu_seqlens, max_seqlen = max_seqlen, loop_steps=get_loop_steps(step), return_output_weights=True)
                         loss = F.cross_entropy(logits[:, :-1, :].view(-1, logits.size(-1)), ids[:, 1:].reshape(-1))
-                        val_loss += loss
+                        val_loss += loss.item()
                         val_examples += 1
-                    val_loss = val_loss.item() / val_examples
+                    val_loss = val_loss / val_examples
                     writer.add_scalar("val/loss", val_loss, documents)
             print(f"step: {step} | epoch: {epoch} | loss: {np.mean(losses[-val_every:]):.4f} | val loss {val_loss:.4f} | lr mult: {get_lr(step):.2f} | avg step time: {(time.time() - start_time)/(step+1):.3f}s | train documents: {documents}")
             save_model()

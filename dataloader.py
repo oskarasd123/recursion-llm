@@ -38,8 +38,9 @@ class FineWebDataLoader(IterableDataset):
             tokens = self.tokenizer(
                 text,
                 truncation=True,
-                max_length=self.max_length-1,
-            )["input_ids"] + [self.tokenizer.eos_token_id]
+                max_length=self.max_length-2,
+            )["input_ids"]
+            tokens = tokens + [self.tokenizer.eos_token_id]*2
             if sum(lengths) + len(tokens) > self.max_length:
                 dict = self._prepare_batch(token_buffer, lengths)
                 dict["texts"] = texts
@@ -77,7 +78,8 @@ class MaxLenFineWebDataLoader(FineWebDataLoader):
             tokens = self.tokenizer(
                 text,
                 truncation=True
-            )["input_ids"] + [self.tokenizer.eos_token_id]
+            )["input_ids"]
+            tokens = tokens + [self.tokenizer.eos_token_id]*2
             while sum(lengths) + len(tokens) > self.max_length:
                 split_pos = self.max_length-sum(lengths)
                 current = tokens[:split_pos]
@@ -104,32 +106,59 @@ class MaxLenFineWebDataLoader(FineWebDataLoader):
 
 if __name__ == "__main__":
     from transformers import AutoTokenizer
+    import torch.nn.functional as F
     import time
     import numpy as np
+    from engram import EngramEmbeddings
+    from tokenizer_compressor import create_token_compression_map
     # Load a common tokenizer
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token # GPT2 doesn't have a pad token by default
-    max_len = 4096
+    max_len = 16348
     # Initialize the dataloader
     dataset = MaxLenFineWebDataLoader(tokenizer, subset="sample-10BT", edu=True, max_length=max_len, num_val_documents=10000)
     dataloader = DataLoader(dataset, 1, num_workers=1)
-    val_dataloader = DataLoader(dataset.val_data, 1, num_workers=1)
+    val_dataloader = MaxLenFineWebDataLoader(tokenizer, subset="sample-10BT", edu=True, max_length=max_len, num_val_documents=10000, val=True)
+    
+    compression_map = create_token_compression_map(tokenizer, True)
+    ngram_order = 2
+    engrams = [EngramEmbeddings(2**17, 64, compression_map, 1, ngram_order) for i in range(5)]
+    
 
-
+    hashes_func1 = 0
+    hashes_func2 = 0
+    ideal_hashes = 0
+    ideal_uncompressed_hashes = 0
     iterator = iter(dataloader)
     filled = []
-    for i in range(512):
+    batches = 512
+    for i in range(batches):
         batch = next(iterator)
         length = batch["input_ids"].shape[1]
         fill_frac = length/max_len
         filled.append(fill_frac)
+        hashes_func1 += sum([engram.get_ngram_hashes(batch["input_ids"]).unique().numel() for engram in engrams]) / len(engrams)
+        hashes_func2 += sum([engram.get_chaotic_ngram_hashes(batch["input_ids"]).unique().numel() for engram in engrams]) / len(engrams)
+        input_ids = compression_map[batch["input_ids"]]
+        padded_ids = F.pad(input_ids, (ngram_order-1, 0), value=0)
+        ngrams = padded_ids.unfold(dimension=1, size=ngram_order, step=1).to(torch.int64) # (batch, seq_len, ngram_order)
+        pairs = ngrams[:, :, 0] + ngrams[:, :, 1] * len(tokenizer)
+        ideal_hashes += pairs.unique().numel()
+        # ideal hashes without id compression
+        padded_ids = F.pad(batch["input_ids"], (ngram_order-1, 0), value=0)
+        ngrams = padded_ids.unfold(dimension=1, size=ngram_order, step=1).to(torch.int64) # (batch, seq_len, ngram_order)
+        pairs = ngrams[:, :, 0] + ngrams[:, :, 1] * len(tokenizer)
+        ideal_uncompressed_hashes += pairs.unique().numel()
         assert length <= max_len
     print(f"fill frac: {np.mean(filled)}\n"\
           f"min filled: {np.min(filled)}\n"\
           f"max filled: {np.max(filled)}"
           )
+    print("hash function 1 average unique hashes:", hashes_func1/batches)
+    print("hash function 2 average unique hashes:", hashes_func2/batches)
+    print("ideal average unique hashes:", ideal_hashes/batches)
+    print("ideal average uncompressed unique hashes:", ideal_uncompressed_hashes/batches)
     val_tokens = 0
     for batch in val_dataloader:
         val_tokens += batch["input_ids"].numel()
-    
     print(f"val tokens: {val_tokens}")

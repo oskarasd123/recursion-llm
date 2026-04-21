@@ -52,6 +52,8 @@ class HalfROPE(nn.Module):
 
 
 class CastedLinear(nn.Linear):
+    def __init__(self, in_features, out_features, bias=True, device=None, dtype=torch.bfloat16):
+        super().__init__(in_features, out_features, bias, device, dtype)
     def forward(self, x):
         return F.linear(x, self.weight.type_as(x), self.bias.type_as(x) if self.bias is not None else None)
 
@@ -105,12 +107,12 @@ class CausalAttn(nn.Module):
         self.head_dim = dim // num_heads
         self.window_size = window_size
 
-        self.q_lin = CastedLinear(dim, dim, dtype=torch.bfloat16)
-        self.k_lin = CastedLinear(dim, dim, dtype=torch.bfloat16)
-        self.v_lin = CastedLinear(dim, dim, dtype=torch.bfloat16)
-        self.o_lin = CastedLinear(dim, dim, dtype=torch.bfloat16)
-        self.verification_lin = CastedLinear(self.head_dim, self.head_dim, dtype=torch.bfloat16)
-        self.verification_lin.weight.data.zero_()
+        self.q_lin = CastedLinear(dim, dim)
+        self.k_lin = CastedLinear(dim, dim)
+        self.v_lin = CastedLinear(dim, dim)
+        self.o_lin = CastedLinear(dim, dim)
+        #self.verification_lin = CastedLinear(self.head_dim, self.head_dim)
+        #self.verification_lin.weight.data.zero_()
         self.o_lin.weight.data.zero_()
         self.attn_gate = SliceLinear(20, num_heads)
 
@@ -125,16 +127,16 @@ class CausalAttn(nn.Module):
         rope = args.rope
         cu_seqlens, max_seqlen = args.cu_seqlens, args.max_seqlen
         
-        q, k = rope(q), rope(k)
+        q_r, k = rope(q), rope(k)
 
-        o = flash_attn_varlen_func(q[0], k[0], v[0], 
+        o = flash_attn_varlen_func(q_r[0], k[0], v[0], 
                                 cu_seqlens, cu_seqlens, 
                                 max_seqlen, max_seqlen,
                                 causal=True, window_size=(self.window_size, 0))
         #o = flash_attn_func(q, k, v, causal=True, window_size=(self.window_size, 0))
         o = o.view(B, T, self.num_heads, self.head_dim)
-        o = o * (torch.sigmoid(torch.sum(self.verification_lin(o) * q, -1, keepdim=True)) * torch.sigmoid(self.attn_gate(x).view(B, T, self.num_heads, 1)))
-        #o = o * torch.sigmoid(self.attn_gate(x).view(B, T, self.num_heads, 1))
+        #o = o * (torch.sigmoid(self.attn_gate(x).view(B, T, self.num_heads, 1)) * torch.sigmoid(torch.mean(self.verification_lin(o) * q, -1, keepdim=True)))
+        o = o * torch.sigmoid(self.attn_gate(x).view(B, T, self.num_heads, 1))
         #o = o.transpose(1, 2).contiguous()
         o = o.view(B, T, D)
         return self.o_lin(o)
@@ -170,8 +172,6 @@ class Model(nn.Module):
         self.end_mlp = MLP(dim)
         self.middle_block = Block(dim, num_heads, window_size*2)
         self.value_embeds = nn.ModuleList([ShortEmbedding(num_embeddings, dim, 4) for i in range(3)])
-        #self.smear_gate = SliceLinear(10, 1, 10)
-        #self.smear_linear = CastedLinear(dim, dim)
         self.end_gate = SliceLinear(20, 1, slice_start=40) # use different slice from attn_gate
         
         # Weight tying improves learning efficiency
@@ -184,16 +184,15 @@ class Model(nn.Module):
             cu_seqlens = torch.tensor([0, ids.size(1)], dtype=torch.int32, device=ids.device)
             max_seqlen = ids.size(1)
         x0 = self.embed(ids).to(torch.bfloat16)
-        #x0 = torch.cat([x0[:1], x0[1:] + torch.sigmoid(self.smear_gate(x0[1:])) * self.smear_linear(x0[:-1])], dim=0)
         x = x0
         half = len(self.blocks)//2
         ve = [embed(ids).to(torch.bfloat16) for embed in self.value_embeds]
         value_embeds = [None, ve[0], ve[1]] + [ve[2]]*(half-3)
         outputs = []
         end_gates = []
+        attn_args = AttnArgs(self.rope, cu_seqlens, max_seqlen)
         for _ in range(loop_steps):
             skip_connections = []
-            attn_args = AttnArgs(self.rope, cu_seqlens, max_seqlen)
             for block, v0 in zip(self.blocks[:half], value_embeds):
                 x = block(x, attn_args, xs=v0, x0=x0)
                 skip_connections.append(x)
@@ -202,7 +201,8 @@ class Model(nn.Module):
             x = self.middle_block(x, attn_args, xs=v0, x0=x0)
             for block, xs in zip(self.blocks[half:], reversed(skip_connections)):
                 x = block(x, attn_args, xs=xs, x0=x0)
-            o = x + self.end_mlp(norm(x)) # mlp that transforms vectors from thought space into embedding space
+            x = norm(x)
+            o = x + self.end_mlp(x) # mlp that transforms vectors from thought space into embedding space
             outputs.append(o)
             end_gates.append(torch.sigmoid(self.end_gate(x)))
         
