@@ -3,6 +3,7 @@ from torch import nn, Tensor
 import torch.nn.functional as F
 from flash_attn import flash_attn_func, flash_attn_varlen_func
 from dataclasses import dataclass
+from engram import EngramEmbeddings
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -96,11 +97,7 @@ class AttnArgs:
     rope : ROPE
     cu_seqlens : Tensor
     max_seqlen : Tensor
-
-#torch.compiler.allow_in_graph(flash_attn_varlen_func)
-#flash_attn_varlen_func = torch.compiler.disable(flash_attn_varlen_func)
-
-class CausalAttn(nn.Module):
+class CausalSelfAttn(nn.Module):
     def __init__(self, dim, num_heads, window_size = -1):
         super().__init__()
         self.num_heads = num_heads
@@ -141,20 +138,76 @@ class CausalAttn(nn.Module):
         o = o.view(B, T, D)
         return self.o_lin(o)
 
+class CausalAttn(nn.Module):
+    def __init__(self, dim, num_heads, window_size = -1):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.window_size = window_size
+
+        self.q_lin = CastedLinear(dim, dim)
+        self.k_lin = CastedLinear(dim, dim)
+        self.v_lin = CastedLinear(dim, dim)
+        self.o_lin = CastedLinear(dim, dim)
+        self.verification_lin = CastedLinear(self.head_dim, self.head_dim)
+        self.verification_lin.weight.data.zero_()
+        self.o_lin.weight.data.zero_()
+        self.attn_gate = SliceLinear(20, num_heads)
+
+        
+    def forward(self, x_q : Tensor, x_kv, args : AttnArgs):
+        B, T, D = x_q.shape
+        assert B == 1 # varlen_func requires B == 1
+        q = self.q_lin(x_q).view(B, T, self.num_heads, self.head_dim)
+        k = self.k_lin(x_kv).view(B, T, self.num_heads, self.head_dim)
+        v = self.v_lin(x_kv).view(B, T, self.num_heads, self.head_dim)
+
+        rope = args.rope
+        cu_seqlens, max_seqlen = args.cu_seqlens, args.max_seqlen
+        
+        q_r, k = rope(q), rope(k)
+
+        o = flash_attn_varlen_func(q_r[0], k[0], v[0], 
+                                cu_seqlens, cu_seqlens, 
+                                max_seqlen, max_seqlen,
+                                causal=True, window_size=(self.window_size, 0))
+        #o = flash_attn_func(q, k, v, causal=True, window_size=(self.window_size, 0))
+        o = o.view(B, T, self.num_heads, self.head_dim)
+        o = o * (torch.sigmoid(self.attn_gate(x_q).view(B, T, self.num_heads, 1)) * torch.sigmoid(torch.mean(self.verification_lin(o) * q, -1, keepdim=True)))
+        #o = o * torch.sigmoid(self.attn_gate(x_q).view(B, T, self.num_heads, 1))
+        #o = o.transpose(1, 2).contiguous()
+        o = o.view(B, T, D)
+        return self.o_lin(o)
+
 class Block(nn.Module):
     def __init__(self, dim, num_heads, window_size=-1):
         super().__init__()
-        self.attn = CausalAttn(dim, num_heads, window_size)
+        self.attn = CausalSelfAttn(dim, num_heads, window_size)
         self.mlp = MLP(dim)
         self.xs_gate = nn.Parameter(torch.zeros(dim))
         self.x0_gate = nn.Parameter(torch.zeros(dim))
+        #self.x_gate = nn.Parameter(torch.ones(dim))
     
     def forward(self, x, args, xs = None, x0 = None):
         if xs is not None:
             x = x + xs * self.xs_gate.type_as(xs)
         if x0 is not None:
             x = x + x0 * self.x0_gate.type_as(x0)
+        #x = x * self.x_gate
         x = x + self.attn(norm(x), args)
+        x = x + self.mlp(norm(x))
+        return x
+
+class EngramBlock(nn.Module):
+    def __init__(self, dim, num_heads, table_size, engram_heads = 8, engram_order = 2, window_size = -1):
+        super().__init__()
+        self.engram_embed = EngramEmbeddings(table_size, dim, num_heads=engram_heads, ngram_order=engram_order, dtype=torch.bfloat16)
+        self.attn = CausalAttn(dim, num_heads, window_size)
+        self.mlp = MLP(dim)
+    
+    def forward(self, x, ids, attn_args : AttnArgs):
+        engram = self.engram_embed(ids)
+        x = x + self.attn(norm(x), engram, attn_args)
         x = x + self.mlp(norm(x))
         return x
 
@@ -166,14 +219,15 @@ class Model(nn.Module):
         self.num_heads = num_heads
         self.window_size = window_size
         self.embed = nn.Embedding(num_embeddings, dim)
+        self.value_embeds = nn.ModuleList([ShortEmbedding(num_embeddings, dim, 4) for i in range(3)])
         self.blocks = nn.ModuleList([Block(dim, num_heads, window_size) for i in range(num_layers)])
         self.rope = ROPE(dim//num_heads, 1000, max_seq_len)
-        self.un_embed = CastedLinear(dim, num_embeddings, bias=False, dtype=torch.bfloat16)
+        self.un_embed = CastedLinear(dim, num_embeddings, bias=False)
         self.end_mlp = MLP(dim)
         self.middle_block = Block(dim, num_heads, window_size*2)
-        self.value_embeds = nn.ModuleList([ShortEmbedding(num_embeddings, dim, 4) for i in range(3)])
+        self.engram_block = EngramBlock(dim, num_heads, 2**16, engram_order=2, window_size=window_size)
         self.end_gate = SliceLinear(20, 1, slice_start=40) # use different slice from attn_gate
-        
+
         # Weight tying improves learning efficiency
         self.embed.weight = self.un_embed.weight
 
@@ -188,6 +242,7 @@ class Model(nn.Module):
         half = len(self.blocks)//2
         ve = [embed(ids).to(torch.bfloat16) for embed in self.value_embeds]
         value_embeds = [None, ve[0], ve[1]] + [ve[2]]*(half-3)
+        #engram_embed = self.engram_lin(self.engram_embed(ids))
         outputs = []
         end_gates = []
         attn_args = AttnArgs(self.rope, cu_seqlens, max_seqlen)
@@ -198,6 +253,7 @@ class Model(nn.Module):
                 skip_connections.append(x)
             if len(self.blocks)%2!=0:
                 skip_connections.append(None)
+            x = self.engram_block(x, ids, attn_args)
             x = self.middle_block(x, attn_args, xs=v0, x0=x0)
             for block, xs in zip(self.blocks[half:], reversed(skip_connections)):
                 x = block(x, attn_args, xs=xs, x0=x0)
@@ -229,4 +285,5 @@ if __name__ == "__main__":
     ids = torch.zeros((1,250), dtype=torch.int32).to("cuda")
     cu_seqlens = torch.tensor([0, 250], dtype=torch.int32).to("cuda")
     max_seqlen = 250
-    print(torch._dynamo.explain(model)(ids, cu_seqlens, max_seqlen))
+    model(ids)
+    #print(torch._dynamo.explain(model)(ids, cu_seqlens, max_seqlen))

@@ -19,14 +19,14 @@ torch._dynamo.config.capture_scalar_outputs = True
 #torch.autograd.set_detect_anomaly(True)
 
 # most hparams are here
-steps = 100
+steps = 10000
 base_grad_accum_steps = 32
 batch_size = 4096
 start_lr = 0.5e-2
 lr = 0.2e-2
 load_checkpoint = False
 val_every = 200
-validate = False
+validate = True
 
 log_dir = "runs/"
 
@@ -59,7 +59,7 @@ if not os.path.exists(log_dir):
 # auto increment log_dir
 dir_index = max(list(map(int, os.listdir(log_dir))) + [-1]) + (0 if load_checkpoint else 1)
 log_dir = f"{log_dir}{dir_index}/"
-
+print(f"using logdir: {log_dir}")
 
 torch.set_float32_matmul_precision("high")
 
@@ -98,6 +98,7 @@ print(f"model size in bytes: {model_size/1024**2:.1f}MiB")
 adam_parameters = []
 muon_parameters = []
 embed_params = []
+engram_params = []
 for n, p in model.named_parameters():
     if p.ndim == 2 and "embed" not in n and "gate" not in n:
         muon_parameters.append(p)
@@ -105,19 +106,40 @@ for n, p in model.named_parameters():
         if "embed" not in n:
             adam_parameters.append(p)
         else:
-            embed_params.append(p)
+            if "engram" in n:
+                engram_params.append(p)
+            else:
+                embed_params.append(p)
 
 optimizer1 = optim.AdamW(adam_parameters, lr = start_lr, betas=(0.9, 0.95), weight_decay=0.1, fused=True)
 optimizer2 = optim.AdamW(embed_params, lr = start_lr, betas=(0.9, 0.95), weight_decay=0.1, fused=True)
 optimizer3 = muon.Muon(muon_parameters, lr = start_lr, momentum=0.8)
-#optimizer4 = optim.Adam(engram_params, lr = start_lr*0.1, betas=(0.9, 0.999), weight_decay=0)
-optimizers = [optimizer1, optimizer2, optimizer3]
+optimizer4 = optim.SparseAdam(engram_params, lr = start_lr, betas=(0.9, 0.999))
+optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
+def dense_to_sparse_gradient(p : Tensor):
+    """
+    Converts a dense gradient tensor into a sparse COO tensor
+    based on rows that contain non-zero values.
+    """
+    if p.grad is None:
+        return
+    
+    grad = p.grad
+    row_mask = (grad != 0).any(dim=1)
+    indices = row_mask.nonzero().flatten()
 
+    values = grad[indices]
+    sparse_grad = torch.sparse_coo_tensor(
+        indices.unsqueeze(0), 
+        values, 
+        grad.shape
+    )
+    p.grad = sparse_grad
 
 
 #def trace_handler(prof: torch.profiler.profile):
@@ -224,7 +246,7 @@ try:
             loss_accum += token_loss.item() / grad_accum_steps
             documents += len(batch["texts"])
             
-        
+        [dense_to_sparse_gradient(param) for param in engram_params]
         for opt in optimizers:
             opt.step()
         model.zero_grad()

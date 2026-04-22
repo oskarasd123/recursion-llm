@@ -107,7 +107,7 @@ class MaxLenFineWebDataLoader(FineWebDataLoader):
 if __name__ == "__main__":
     from transformers import AutoTokenizer
     import torch.nn.functional as F
-    import time
+    from time import perf_counter
     import numpy as np
     from engram import EngramEmbeddings
     from tokenizer_compressor import create_token_compression_map
@@ -158,6 +158,13 @@ if __name__ == "__main__":
     print("hash function 2 average unique hashes:", hashes_func2/batches)
     print("ideal average unique hashes:", ideal_hashes/batches)
     print("ideal average uncompressed unique hashes:", ideal_uncompressed_hashes/batches)
+    start_time = perf_counter()
+    for i in range(batches):
+        batch = next(iterator)
+        length = batch["input_ids"].shape[1]
+        assert length <= max_len
+    end_time = perf_counter()
+    print(f"dataloader load rate: {batches/(end_time - start_time):.02f}batches/sec")
     val_tokens = 0
     for batch in val_dataloader:
         val_tokens += batch["input_ids"].numel()
