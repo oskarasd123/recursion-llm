@@ -15,6 +15,8 @@ import time
 import math
 from model import Model
 import json
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 torch._dynamo.config.capture_scalar_outputs = True
 #torch.autograd.set_detect_anomaly(True)
 
@@ -27,8 +29,21 @@ lr = 0.2e-2
 load_checkpoint = False
 val_every = 200
 validate = True
-
 log_dir = "runs/"
+
+
+dist.init_process_group(backend="nccl")
+
+local_rank = int(os.environ["LOCAL_RANK"])
+rank = int(os.environ["RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
+torch.cuda.set_device(local_rank)
+device = torch.device(f"cuda:{local_rank}")
+master_process = rank == 0
+
+assert base_grad_accum_steps%world_size == 0 # grad_accum_steps must be divisible by world_size
+base_grad_accum_steps = base_grad_accum_steps//world_size
+
 
 def get_lr(step): # learning rate multiplier applied on start_lr
     # Linear warmup, then cosine decay
@@ -54,12 +69,16 @@ def get_grad_accum_steps(step):
         return base_grad_accum_steps*2
     return base_grad_accum_steps*4
 
+def print0(*args, **kwargs):
+    if master_process:
+        print(*args, **kwargs)
+
 if not os.path.exists(log_dir):
     os.mkdir(log_dir)
 # auto increment log_dir
 dir_index = max(list(map(int, os.listdir(log_dir))) + [-1]) + (0 if load_checkpoint else 1)
 log_dir = f"{log_dir}{dir_index}/"
-print(f"using logdir: {log_dir}")
+print0(f"using logdir: {log_dir}")
 
 torch.set_float32_matmul_precision("high")
 
@@ -78,8 +97,9 @@ model = Model(
     num_heads=4,
     window_size=256,
     max_seq_len=batch_size,
-).to("cuda")
+).to(device)
 
+#ddp_model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 model_numel = 0
 embed_numel = 0
 model_size = 0
@@ -89,9 +109,9 @@ for n, p in model.named_parameters():
     else:
         model_numel += p.numel()
     model_size += p.numel() * p.element_size()
-print(f"model numel: {model_numel/1000_000:.1f}M")
-print(f"embed numel: {embed_numel/1000_000:.1f}M")
-print(f"model size in bytes: {model_size/1024**2:.1f}MiB")
+print0(f"model numel: {model_numel/1000_000:.1f}M")
+print0(f"embed numel: {embed_numel/1000_000:.1f}M")
+print0(f"model size in bytes: {model_size/1024**2:.1f}MiB")
 
 
 
@@ -157,15 +177,15 @@ def dense_to_sparse_gradient(p : Tensor):
 #    record_shapes=True,
 #)
 
-
-writer = SummaryWriter(log_dir)
+if master_process:
+    writer = SummaryWriter(log_dir)
 losses = []
 train_iter = iter(train_dataloader)
 
 
 #model.compile()
 model_opt = model
-#model_opt = torch.compile(model, dynamic=True)
+model_opt = torch.compile(model, dynamic=True)
 #prof_ctx.__enter__()
 epoch = 0
 documents = 0
@@ -181,34 +201,34 @@ if load_checkpoint:
     documents = metrics["hparams"]["documents"]
 
 def save_model():
-    state_dict = {
-        "model" : model.state_dict(),
-        "optimizers" : [optimizer.state_dict() for optimizer in optimizers]
-    }
-    torch.save(state_dict, f"{log_dir}/checkpoint.pt")
-    #print("model saved")
-
-    json.dump({
-        "hparams": {
-            "model params":{
-                "num_layers" : model.num_layers,
-                "dim" : model.dim,
-                "num_heads" : model.num_heads,
-                "window_size" : model.window_size
-            },
-            "steps" : steps,
-            "step" : step,
-            "documents" : documents,
-            "lr" : lr,
-            "batch_size" : batch_size,
-            "grad_accum_steps" : grad_accum_steps,
-            "final loop_steps" : get_loop_steps(step),
-        },
-        "metrics" : {
-            "avg_loss" : np.mean(losses[-val_every:]),
-            "val_loss" : val_loss,
+    if master_process:
+        state_dict = {
+            "model" : model.state_dict(),
+            "optimizers" : [optimizer.state_dict() for optimizer in optimizers]
         }
-    }, open(f"{log_dir}/metrics.json", "w"))
+        torch.save(state_dict, f"{log_dir}/checkpoint.pt")
+
+        json.dump({
+            "hparams": {
+                "model params":{
+                    "num_layers" : model.num_layers,
+                    "dim" : model.dim,
+                    "num_heads" : model.num_heads,
+                    "window_size" : model.window_size
+                },
+                "steps" : steps,
+                "step" : step,
+                "documents" : documents,
+                "lr" : lr,
+                "batch_size" : batch_size,
+                "grad_accum_steps" : grad_accum_steps,
+                "final loop_steps" : get_loop_steps(step),
+            },
+            "metrics" : {
+                "avg_loss" : np.mean(losses[-val_every:]),
+                "val_loss" : val_loss,
+            }
+        }, open(f"{log_dir}/metrics.json", "w"))
 
 start_time = time.time()
 try:
@@ -221,6 +241,8 @@ try:
                 group["lr"] = group["initial_lr"] * get_lr(step)
         output_weight_means = []
         loss_accum = 0
+        #no_sync_ctx = ddp_model.no_sync()
+        #no_sync_ctx.__enter__() # don't sync gradients except on the last backward pass
         for i in range(grad_accum_steps):
             try:
                 batch = next(train_iter)
@@ -228,9 +250,11 @@ try:
                 train_iter = iter(train_dataloader)
                 batch = next(train_iter)
                 epoch += 1
+            #if i == grad_accum_steps-1:
+            #    no_sync_ctx.__exit__(None, None, None)
                 
-            ids = batch["input_ids"].to("cuda", non_blocking=True)
-            cu_seqlens = batch["cu_seqlens"].to("cuda", non_blocking=True).squeeze(0)
+            ids = batch["input_ids"].to(device, non_blocking=True)
+            cu_seqlens = batch["cu_seqlens"].to(device, non_blocking=True).squeeze(0)
             max_seqlen = batch["max_seqlen"].item()
             logits, output_weights = model_opt(ids, cu_seqlens = cu_seqlens, max_seqlen = max_seqlen, loop_steps=get_loop_steps(step), return_output_weights=True)
 
@@ -244,18 +268,28 @@ try:
             loss.backward()
             output_weight_means.append(output_weight_mean.to(torch.float32).numpy(force=True))
             loss_accum += token_loss.item() / grad_accum_steps
-            documents += len(batch["texts"])
-            
+            documents += len(batch["texts"]) * world_size
+        
+        handles = []
+        for param in model.parameters():
+            if param.grad is not None:
+                handles.append(dist.all_reduce(param.grad, async_op=True))
+        [handle.wait() for handle in handles]
+        
         [dense_to_sparse_gradient(param) for param in engram_params]
         for opt in optimizers:
             opt.step()
         model.zero_grad()
 
-        output_weight_means = np.mean(output_weight_means, axis=0)
-        for i, v in enumerate(output_weight_means):
-            writer.add_scalar(f"output_mean/{i}", v, documents)
-        losses.append(loss_accum)
-        writer.add_scalar("loss", loss_accum, documents)
+        if master_process:
+            output_weight_means = np.mean(output_weight_means, axis=0)
+            for i, v in enumerate(output_weight_means):
+                writer.add_scalar(f"output_mean/{i}", v, documents)
+            losses.append(loss_accum)
+            writer.add_scalar("loss", loss_accum, documents)
+            print("flushing")
+            writer.flush()
+            print("step done")
         
         if step % val_every == 0:
             val_loss = 0
@@ -263,16 +297,17 @@ try:
             if validate:
                 with torch.no_grad():
                     for batch in test_dataloader:
-                        ids = batch["input_ids"].to("cuda", non_blocking=True)
-                        cu_seqlens = batch["cu_seqlens"].to("cuda", non_blocking=True).squeeze(0)
+                        ids = batch["input_ids"].to(device, non_blocking=True)
+                        cu_seqlens = batch["cu_seqlens"].to(device, non_blocking=True).squeeze(0)
                         max_seqlen = batch["max_seqlen"].item()
                         logits, output_weights = model_opt(ids, cu_seqlens = cu_seqlens, max_seqlen = max_seqlen, loop_steps=get_loop_steps(step), return_output_weights=True)
                         loss = F.cross_entropy(logits[:, :-1, :].view(-1, logits.size(-1)), ids[:, 1:].reshape(-1))
-                        val_loss += loss.item()
+                        dist.reduce(loss, 0)
+                        val_loss += loss.item() / world_size
                         val_examples += 1
-                    val_loss = val_loss / val_examples
-                    writer.add_scalar("val/loss", val_loss, documents)
-            print(f"step: {step} | epoch: {epoch} | loss: {np.mean(losses[-val_every:]):.4f} | val loss {val_loss:.4f} | lr mult: {get_lr(step):.2f} | avg step time: {(time.time() - start_time)/(step+1):.3f}s | train documents: {documents}")
+                    if master_process:
+                        writer.add_scalar("val/loss", val_loss, documents)
+            print0(f"step: {step} | epoch: {epoch} | loss: {np.mean(losses[-val_every:]):.4f} | val loss {val_loss:.4f} | lr mult: {get_lr(step):.2f} | avg step time: {(time.time() - start_time)/(step+1):.3f}s | train documents: {documents}")
             save_model()
         #prof_ctx.step()
     #prof_ctx.__exit__(None, None, None)
@@ -285,3 +320,4 @@ except torch.OutOfMemoryError as e:
     torch.cuda.empty_cache()
     print(e)
 save_model()
+dist.destroy_process_group()

@@ -1,3 +1,5 @@
+import os
+
 import torch
 from datasets import load_dataset
 from torch.utils.data import IterableDataset, DataLoader
@@ -24,6 +26,8 @@ class FineWebDataLoader(IterableDataset):
             name=subset,
             split="train",
         ).shuffle(seed=self.seed)
+        self.rank = int(os.environ["RANK"])
+        self.world_size = int(os.environ["WORLD_SIZE"])
 
 
     def __iter__(self):
@@ -33,6 +37,8 @@ class FineWebDataLoader(IterableDataset):
         range_start = (0 if self.val else self.num_val_documents)
         range_end = (self.num_val_documents if self.val else len(self.dataset))
         for i in range(range_start, range_end):
+            if i % self.world_size != self.rank:
+                continue
             example = self.dataset[i]
             text = example["text"]
             tokens = self.tokenizer(
@@ -72,7 +78,11 @@ class MaxLenFineWebDataLoader(FineWebDataLoader):
         token_buffer = []
         lengths = []
         texts = []
-        for i in range((0 if self.val else self.num_val_documents), (self.num_val_documents if self.val else len(self.dataset))):
+        range_start = (0 if self.val else self.num_val_documents)
+        range_end = (self.num_val_documents if self.val else len(self.dataset))
+        for i in range(range_start, range_end):
+            if i % self.world_size != self.rank:
+                continue
             example = self.dataset[i]
             text = example["text"]
             tokens = self.tokenizer(
