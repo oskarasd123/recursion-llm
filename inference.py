@@ -1,21 +1,21 @@
 import torch
 from torch import nn, Tensor, optim
 import torch.nn.functional as F
-from dataloader import FineWebDataLoader
 from transformers import AutoTokenizer
 import numpy as np
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
-import time
-import math
 from model import Model
 import readline
 import atexit
 import os
 import json
+import argparse
 torch._dynamo.config.capture_scalar_outputs = True
 
-model_path = "./runs/8/"
+parser = argparse.ArgumentParser()
+parser.add_argument("-r", "--run", type=int)
+args = parser.parse_args()
+
+model_path = f"./runs/{args.run}/"
 
 
 HISTORY_FILE = "model_prompts.history"
