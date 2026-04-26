@@ -62,7 +62,6 @@ def get_loop_steps(step):
     return 1
 
 def get_grad_accum_steps(step):
-    return base_grad_accum_steps
     if step < 2000:
         return base_grad_accum_steps
     if step < 3000:
@@ -80,15 +79,13 @@ dir_index = max(list(map(int, os.listdir(log_dir))) + [-1]) + (0 if load_checkpo
 log_dir = f"{log_dir}{dir_index}/"
 print0(f"using logdir: {log_dir}")
 
-torch.set_float32_matmul_precision("high")
-
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
 tokenizer.pad_token = tokenizer.eos_token
 
 dataset = MaxLenFineWebDataLoader(tokenizer, subset="sample-10BT", edu=True, max_length=batch_size, num_val_documents=10000)
 val_dataset = MaxLenFineWebDataLoader(tokenizer, subset="sample-10BT", edu=True, max_length=batch_size, num_val_documents=10000, val=True)
-train_dataloader = DataLoader(dataset, batch_size=1, num_workers=1)
-test_dataloader = DataLoader(val_dataset, batch_size=1, num_workers=1)
+train_dataloader = DataLoader(dataset, batch_size=1, num_workers=1, prefetch_factor=2)
+test_dataloader = DataLoader(val_dataset, batch_size=1, num_workers=1, prefetch_factor=2)
 
 model = Model(
     num_embeddings=len(tokenizer),
@@ -98,8 +95,9 @@ model = Model(
     window_size=256,
     max_seq_len=batch_size,
 ).to(device)
-
-#ddp_model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+model_opt = model
+model_opt = torch.compile(model)
+ddp_model = DDP(model_opt, device_ids=[local_rank], find_unused_parameters=True)
 model_numel = 0
 embed_numel = 0
 model_size = 0
@@ -182,10 +180,6 @@ if master_process:
 losses = []
 train_iter = iter(train_dataloader)
 
-
-#model.compile()
-model_opt = model
-model_opt = torch.compile(model, dynamic=True)
 #prof_ctx.__enter__()
 epoch = 0
 documents = 0
@@ -241,8 +235,8 @@ try:
                 group["lr"] = group["initial_lr"] * get_lr(step)
         output_weight_means = []
         loss_accum = 0
-        #no_sync_ctx = ddp_model.no_sync()
-        #no_sync_ctx.__enter__() # don't sync gradients except on the last backward pass
+        no_sync_ctx = ddp_model.no_sync()
+        no_sync_ctx.__enter__() # don't sync gradients except on the last backward pass
         for i in range(grad_accum_steps):
             try:
                 batch = next(train_iter)
@@ -250,13 +244,13 @@ try:
                 train_iter = iter(train_dataloader)
                 batch = next(train_iter)
                 epoch += 1
-            #if i == grad_accum_steps-1:
-            #    no_sync_ctx.__exit__(None, None, None)
+            if i == grad_accum_steps-1:
+                no_sync_ctx.__exit__(None, None, None)
                 
             ids = batch["input_ids"].to(device, non_blocking=True)
             cu_seqlens = batch["cu_seqlens"].to(device, non_blocking=True).squeeze(0)
             max_seqlen = batch["max_seqlen"].item()
-            logits, output_weights = model_opt(ids, cu_seqlens = cu_seqlens, max_seqlen = max_seqlen, loop_steps=get_loop_steps(step), return_output_weights=True)
+            logits, output_weights = ddp_model(ids, cu_seqlens = cu_seqlens, max_seqlen = max_seqlen, loop_steps=get_loop_steps(step), return_output_weights=True)
 
             token_loss = F.cross_entropy(logits[:, :-1, :].view(-1, logits.size(-1)), ids[:, 1:].reshape(-1))
 
@@ -270,12 +264,6 @@ try:
             loss_accum += token_loss.item() / grad_accum_steps
             documents += len(batch["texts"]) * world_size
         
-        handles = []
-        for param in model.parameters():
-            if param.grad is not None:
-                handles.append(dist.all_reduce(param.grad, async_op=True))
-        [handle.wait() for handle in handles]
-        
         [dense_to_sparse_gradient(param) for param in engram_params]
         for opt in optimizers:
             opt.step()
@@ -287,9 +275,7 @@ try:
                 writer.add_scalar(f"output_mean/{i}", v, documents)
             losses.append(loss_accum)
             writer.add_scalar("loss", loss_accum, documents)
-            print("flushing")
             writer.flush()
-            print("step done")
         
         if step % val_every == 0:
             val_loss = 0
@@ -300,11 +286,17 @@ try:
                         ids = batch["input_ids"].to(device, non_blocking=True)
                         cu_seqlens = batch["cu_seqlens"].to(device, non_blocking=True).squeeze(0)
                         max_seqlen = batch["max_seqlen"].item()
-                        logits, output_weights = model_opt(ids, cu_seqlens = cu_seqlens, max_seqlen = max_seqlen, loop_steps=get_loop_steps(step), return_output_weights=True)
+                        logits, output_weights = ddp_model(ids, cu_seqlens = cu_seqlens, max_seqlen = max_seqlen, loop_steps=get_loop_steps(step), return_output_weights=True)
                         loss = F.cross_entropy(logits[:, :-1, :].view(-1, logits.size(-1)), ids[:, 1:].reshape(-1))
-                        dist.reduce(loss, 0)
-                        val_loss += loss.item() / world_size
+                        val_loss += loss.item()
                         val_examples += 1
+                    val_loss = torch.tensor(val_loss, device="cuda")
+                    dist.reduce(val_loss, 0)
+                    val_loss = val_loss.item()
+                    val_examples = torch.tensor(val_examples, device="cuda")
+                    dist.reduce(val_examples, 0)
+                    val_examples = val_examples.item()
+                    val_loss /= val_examples
                     if master_process:
                         writer.add_scalar("val/loss", val_loss, documents)
             print0(f"step: {step} | epoch: {epoch} | loss: {np.mean(losses[-val_every:]):.4f} | val loss {val_loss:.4f} | lr mult: {get_lr(step):.2f} | avg step time: {(time.time() - start_time)/(step+1):.3f}s | train documents: {documents}")
