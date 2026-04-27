@@ -17,6 +17,7 @@ from model import Model
 import json
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from contextlib import nullcontext
 torch._dynamo.config.capture_scalar_outputs = True
 #torch.autograd.set_detect_anomaly(True)
 
@@ -31,12 +32,13 @@ val_every = 200
 validate = True
 log_dir = "runs/"
 
+local_rank = int(os.environ.get("LOCAL_RANK", 0))
+rank = int(os.environ.get("RANK", 0))
+world_size = int(os.environ.get("WORLD_SIZE", 1))
 
-dist.init_process_group(backend="nccl")
+if world_size > 1:
+    dist.init_process_group(backend="nccl")
 
-local_rank = int(os.environ["LOCAL_RANK"])
-rank = int(os.environ["RANK"])
-world_size = int(os.environ["WORLD_SIZE"])
 torch.cuda.set_device(local_rank)
 device = torch.device(f"cuda:{local_rank}")
 master_process = rank == 0
@@ -97,7 +99,11 @@ model = Model(
 ).to(device)
 model_opt = model
 model_opt = torch.compile(model)
-ddp_model = DDP(model_opt, device_ids=[local_rank], find_unused_parameters=True)
+if world_size > 1:
+    ddp_model = DDP(model_opt, device_ids=[local_rank], find_unused_parameters=True)
+else:
+    ddp_model = model_opt # Mimmic DDP's functions
+    ddp_model.no_sync = nullcontext
 model_numel = 0
 embed_numel = 0
 model_size = 0
@@ -290,12 +296,13 @@ try:
                         loss = F.cross_entropy(logits[:, :-1, :].view(-1, logits.size(-1)), ids[:, 1:].reshape(-1))
                         val_loss += loss.item()
                         val_examples += 1
-                    val_loss = torch.tensor(val_loss, device="cuda")
-                    dist.reduce(val_loss, 0)
-                    val_loss = val_loss.item()
-                    val_examples = torch.tensor(val_examples, device="cuda")
-                    dist.reduce(val_examples, 0)
-                    val_examples = val_examples.item()
+                    if world_size > 1:
+                        val_loss = torch.tensor(val_loss, device="cuda")
+                        dist.reduce(val_loss, 0)
+                        val_loss = val_loss.item()
+                        val_examples = torch.tensor(val_examples, device="cuda")
+                        dist.reduce(val_examples, 0)
+                        val_examples = val_examples.item()
                     val_loss /= val_examples
                     if master_process:
                         writer.add_scalar("val/loss", val_loss, documents)

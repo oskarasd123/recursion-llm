@@ -26,8 +26,8 @@ class FineWebDataLoader(IterableDataset):
             name=subset,
             split="train",
         ).shuffle(seed=self.seed)
-        self.rank = int(os.environ["RANK"])
-        self.world_size = int(os.environ["WORLD_SIZE"])
+        self.rank = int(os.environ.get("RANK", 0))
+        self.world_size = int(os.environ.get("WORLD_SIZE", 1))
 
 
     def __iter__(self):
@@ -174,7 +174,7 @@ if __name__ == "__main__":
         length = batch["input_ids"].shape[1]
         assert length <= max_len
     end_time = perf_counter()
-    print(f"dataloader load rate: {batches/(end_time - start_time):.02f}batches/sec")
+    print(f"dataloader load rate: {batches/(end_time - start_time):.02f}batches/sec, {batches/(end_time - start_time)*max_len:.02f}tokens/sec")
     val_tokens = 0
     for batch in val_dataloader:
         val_tokens += batch["input_ids"].numel()
