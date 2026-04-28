@@ -4,6 +4,6 @@ I have taken a lot of inspiration from [modded nanogpt](https://github.com/Kelle
 My goal is to make a somewhat optimised training setup and then try to find modifications that improve the model's learning efficiency.<br>
 ## If you want to run it yourself
 - Install dependencies with commands in `setup.sh`(This script is mostly for automated installation in containers).
-- Download the dataset. This happens on first run of either `dataloader.py` or `train.py`.
+- Download the dataset. This happens on first run of either `dataloader.py` or `train.py`. Getting a huggingface token (`HF_TOKEN` in environment) will increase rate limits for downloading.
 - Run training script with `python3 train.py` or `torchrun --nproc_per_node=2 train.py` when training with multiple gpus.
-NB! running train.py on multiple gpus before downloading the dataset will start multiple downloads.
+NB! running train.py on multiple gpus before downloading the dataset will start multiple downloads.<br>

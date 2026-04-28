@@ -23,8 +23,8 @@ torch._dynamo.config.capture_scalar_outputs = True
 
 # most hparams are here
 steps = 10000
-base_grad_accum_steps = 16
-batch_size = 8192
+base_grad_accum_steps = 32
+batch_size = 4096
 start_lr = 0.5e-2
 lr = 0.2e-2
 load_checkpoint = False
@@ -227,6 +227,7 @@ def save_model():
             "metrics" : {
                 "avg_loss" : np.mean(losses[-val_every:]),
                 "val_loss" : val_loss,
+                "instruction_loss" : instruction_loss,
             }
         }, open(f"{log_dir}/metrics.json", "w"))
 

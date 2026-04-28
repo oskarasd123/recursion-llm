@@ -7,4 +7,5 @@ pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128 --fo
 
 pip install flash-attn --no-build-isolation # takes a long time if it builds from source
 pip install -r requirements.txt
-screen -dmS tensorboard tensorboard --logdir=runs
+# screen is useful as a terminal multiplexer
+#screen -dmS tensorboard tensorboard --logdir=runs
