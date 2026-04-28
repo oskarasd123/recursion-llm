@@ -44,9 +44,9 @@ class FineWebDataLoader(IterableDataset):
             tokens = self.tokenizer(
                 text,
                 truncation=True,
-                max_length=self.max_length-2,
+                max_length=self.max_length-1,
             )["input_ids"]
-            tokens = tokens + [self.tokenizer.eos_token_id]*2
+            tokens = tokens + [self.tokenizer.eos_token_id]
             if sum(lengths) + len(tokens) > self.max_length:
                 dict = self._prepare_batch(token_buffer, lengths)
                 dict["texts"] = texts
@@ -89,7 +89,7 @@ class MaxLenFineWebDataLoader(FineWebDataLoader):
                 text,
                 truncation=True
             )["input_ids"]
-            tokens = tokens + [self.tokenizer.eos_token_id]*2
+            tokens = tokens + [self.tokenizer.eos_token_id]
             while sum(lengths) + len(tokens) > self.max_length:
                 split_pos = self.max_length-sum(lengths)
                 current = tokens[:split_pos]
@@ -143,22 +143,17 @@ class InstructionDataset(FineWebDataLoader):
             text = self.format_prompt(example)
             tokens = self.tokenizer(
                 text,
-                truncation=True
+                truncation=True,
+                max_length=self.max_length-1,
             )["input_ids"]
-            tokens = tokens + [self.tokenizer.eos_token_id]*2
-            while sum(lengths) + len(tokens) > self.max_length:
-                split_pos = self.max_length-sum(lengths)
-                current = tokens[:split_pos]
-                next = tokens[split_pos:]
-                token_buffer.extend(current)
-                lengths.append(len(current))
+            tokens = tokens + [self.tokenizer.eos_token_id]
+            if sum(lengths) + len(tokens) > self.max_length:
                 dict = self._prepare_batch(token_buffer, lengths)
                 dict["texts"] = texts
                 yield dict
                 token_buffer = []
                 lengths = []
                 texts = []
-                tokens = next
                 
             token_buffer.extend(tokens)
             lengths.append(len(tokens))

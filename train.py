@@ -5,7 +5,7 @@ import torch
 from torch import nn, Tensor, optim
 import torch.nn.functional as F
 import muon # no muon in torch==2.8.0
-from dataloader import FineWebDataLoader, MaxLenFineWebDataLoader
+from dataloader import FineWebDataLoader, MaxLenFineWebDataLoader, InstructionDataset
 from tokenizer_compressor import create_token_compression_map
 from transformers import AutoTokenizer
 import numpy as np
@@ -23,8 +23,8 @@ torch._dynamo.config.capture_scalar_outputs = True
 
 # most hparams are here
 steps = 10000
-base_grad_accum_steps = 32
-batch_size = 4096
+base_grad_accum_steps = 16
+batch_size = 8192
 start_lr = 0.5e-2
 lr = 0.2e-2
 load_checkpoint = False
@@ -84,15 +84,17 @@ tokenizer.pad_token = tokenizer.eos_token
 
 dataset = MaxLenFineWebDataLoader(tokenizer, subset="sample-10BT", edu=True, max_length=batch_size, num_val_documents=10000)
 val_dataset = MaxLenFineWebDataLoader(tokenizer, subset="sample-10BT", edu=True, max_length=batch_size, num_val_documents=10000, val=True)
+instruction_dataset = InstructionDataset(tokenizer, batch_size) # used for validation
 train_dataloader = DataLoader(dataset, batch_size=1, num_workers=1)
 test_dataloader = DataLoader(val_dataset, batch_size=1, num_workers=1)
+instruction_dataloader = DataLoader(instruction_dataset, batch_size=1, num_workers=1)
 
 model = Model(
     num_embeddings=len(tokenizer),
     dim=128*4,
     num_layers=12,
     num_heads=4,
-    window_size=256,
+    window_size=512,
     max_seq_len=batch_size,
 ).to(device)
 model_opt = model
@@ -284,6 +286,8 @@ try:
         if step % val_every == 0:
             val_loss = 0
             val_examples = 0
+            instruction_loss = 0
+            instruction_examples = 0
             if validate:
                 with torch.no_grad():
                     for batch in test_dataloader:
@@ -294,6 +298,14 @@ try:
                         loss = F.cross_entropy(logits[:, :-1, :].view(-1, logits.size(-1)), ids[:, 1:].reshape(-1))
                         val_loss += loss.item()
                         val_examples += 1
+                    for batch in instruction_dataloader:
+                        ids = batch["input_ids"].to(device, non_blocking=True)
+                        cu_seqlens = batch["cu_seqlens"].to(device, non_blocking=True).squeeze(0)
+                        max_seqlen = batch["max_seqlen"].item()
+                        logits, output_weights = ddp_model(ids, cu_seqlens = cu_seqlens, max_seqlen = max_seqlen, loop_steps=get_loop_steps(step), return_output_weights=True)
+                        loss = F.cross_entropy(logits[:, :-1, :].view(-1, logits.size(-1)), ids[:, 1:].reshape(-1))
+                        instruction_loss += loss.item()
+                        instruction_examples += 1
                     if world_size > 1:
                         val_loss = torch.tensor(val_loss, device="cuda")
                         dist.reduce(val_loss, 0)
@@ -301,9 +313,18 @@ try:
                         val_examples = torch.tensor(val_examples, device="cuda")
                         dist.reduce(val_examples, 0)
                         val_examples = val_examples.item()
+                        
+                        instruction_loss = torch.tensor(instruction_loss, device="cuda")
+                        dist.reduce(instruction_loss, 0)
+                        instruction_loss = instruction_loss.item()
+                        instruction_examples = torch.tensor(instruction_examples, device="cuda")
+                        dist.reduce(instruction_examples, 0)
+                        instruction_examples = instruction_examples.item()
                     val_loss /= val_examples
+                    instruction_loss /= instruction_examples
                     if master_process:
                         writer.add_scalar("val/loss", val_loss, documents)
+                        writer.add_scalar("val/instruction_loss", instruction_loss, documents)
             print0(f"step: {step} | epoch: {epoch} | loss: {np.mean(losses[-val_every:]):.4f} | val loss {val_loss:.4f} | lr mult: {get_lr(step):.2f} | avg step time: {(time.time() - start_time)/(step+1):.3f}s | train documents: {documents}")
             save_model()
         #prof_ctx.step()
