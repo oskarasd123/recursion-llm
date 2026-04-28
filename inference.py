@@ -70,8 +70,8 @@ model_opt = model
 def color_bg(text, r, g, b):
     return f"\x1b[48;2;{int(r)};{int(g)};{int(b)}m{text}\x1b[0m"
 
-try:
-    while True:
+while True:
+    try:
         text = input("\033[1;32;40m$\033[0;0;0mprompt: ")
         loop_steps = hparams.get("final loop_steps", 1)
         if "%" in text:
@@ -88,10 +88,10 @@ try:
             print(text, end="")
         else:
             print("\033[F", end='') # move cursor to the start of the previous line
-        for i in range(80):
+        for i in range(150):
             logits, output_weights = model_opt(ids.unsqueeze(0),
-                     loop_steps=loop_steps,
-                     return_output_weights=True,
+                        loop_steps=loop_steps,
+                        return_output_weights=True,
             )
             output_weights : Tensor = output_weights.squeeze(0)
             logits = logits.squeeze(0)
@@ -109,8 +109,8 @@ try:
                 if loop_steps > 1:
                     t = np.mean(new_output_weight_depths) / (loop_steps-1)
                     r = 0 if len(new_ids) == 1 else 128
-                    g = t**0.5*255
-                    b = (1-t)**0.5*255
+                    g = (1-t)**0.5*255
+                    b = t**0.5*255
                     print(color_bg(new_text, r, g, b), end="", flush=True)
                 else:
                     print(new_text, end="", flush=True)
@@ -122,8 +122,9 @@ try:
                     token = new_ids.pop(0)
                     print(tokenizer.decode([token]), end="")
         print()
-except KeyboardInterrupt:
-    print("^C")
-except EOFError:
-    print("^D")
+    except KeyboardInterrupt:
+        print(" press ctrl+D to exit")
+    except EOFError:
+        print("^D")
+        break
 
