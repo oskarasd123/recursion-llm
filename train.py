@@ -66,9 +66,7 @@ def get_loop_steps(step):
 def get_grad_accum_steps(step):
     if step < 2000:
         return base_grad_accum_steps
-    if step < 3000:
-        return base_grad_accum_steps*2
-    return base_grad_accum_steps*4
+    return base_grad_accum_steps*2
 
 def print0(*args, **kwargs):
     if master_process:

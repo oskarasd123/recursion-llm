@@ -110,7 +110,63 @@ class MaxLenFineWebDataLoader(FineWebDataLoader):
         dict = self._prepare_batch(token_buffer, lengths)
         dict["texts"] = texts
         yield dict
-    
+
+class InstructionDataset(FineWebDataLoader):
+    def __init__(self, tokenizer, max_length=512):
+        self.dataset = load_dataset("tatsu-lab/alpaca", split="train")
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.rank = int(os.environ.get("RANK", 0))
+        self.world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    def format_prompt(self, example):
+        # Common format for instruction tuning
+        instruction = example.get("instruction", "")
+        input_text = example.get("input", "")
+        response = example.get("output", "")
+        
+        prompt = (
+            f"### Instruction:\n{instruction}\n\n" + 
+            (f"### Input:\n{input_text}\n\n" if input_text else "") + 
+            f"### Response:\n{response}"
+        )
+        return prompt
+
+    def __iter__(self):
+        token_buffer = []
+        lengths = []
+        texts = []
+        for i in range(0, len(self.dataset)):
+            if i % self.world_size != self.rank:
+                continue
+            example = self.dataset[i]
+            text = self.format_prompt(example)
+            tokens = self.tokenizer(
+                text,
+                truncation=True
+            )["input_ids"]
+            tokens = tokens + [self.tokenizer.eos_token_id]*2
+            while sum(lengths) + len(tokens) > self.max_length:
+                split_pos = self.max_length-sum(lengths)
+                current = tokens[:split_pos]
+                next = tokens[split_pos:]
+                token_buffer.extend(current)
+                lengths.append(len(current))
+                dict = self._prepare_batch(token_buffer, lengths)
+                dict["texts"] = texts
+                yield dict
+                token_buffer = []
+                lengths = []
+                texts = []
+                tokens = next
+                
+            token_buffer.extend(tokens)
+            lengths.append(len(tokens))
+            texts.append(text)
+        dict = self._prepare_batch(token_buffer, lengths)
+        dict["texts"] = texts
+        yield dict
+
 
 
 
@@ -129,6 +185,7 @@ if __name__ == "__main__":
     dataset = MaxLenFineWebDataLoader(tokenizer, subset="sample-10BT", edu=True, max_length=max_len, num_val_documents=10000)
     dataloader = DataLoader(dataset, 1, num_workers=1)
     val_dataloader = MaxLenFineWebDataLoader(tokenizer, subset="sample-10BT", edu=True, max_length=max_len, num_val_documents=10000, val=True)
+    instruction_dataloader = InstructionDataset(tokenizer, max_len)
     
     compression_map = create_token_compression_map(tokenizer, True)
     ngram_order = 2
@@ -179,3 +236,8 @@ if __name__ == "__main__":
     for batch in val_dataloader:
         val_tokens += batch["input_ids"].numel()
     print(f"val tokens: {val_tokens}")
+    instruction_tokens = 0
+    for batch in instruction_dataloader:
+        instruction_tokens += len(batch["input_ids"])
+    print(f"instruction tokens: {instruction_tokens}")
+    print(batch["texts"][0])

@@ -12,7 +12,7 @@ import argparse
 torch._dynamo.config.capture_scalar_outputs = True
 
 parser = argparse.ArgumentParser()
-parser.add_argument("-r", "--run", type=int)
+parser.add_argument("-r", "--run", type=str)
 args = parser.parse_args()
 
 model_path = f"./runs/{args.run}/"
