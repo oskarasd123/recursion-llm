@@ -66,7 +66,9 @@ def get_loop_steps(step):
 def get_grad_accum_steps(step):
     if step < 2000:
         return base_grad_accum_steps
-    return base_grad_accum_steps*2
+    if step < 4000:
+        return base_grad_accum_steps*2
+    return base_grad_accum_steps*4
 
 def print0(*args, **kwargs):
     if master_process:
@@ -124,7 +126,7 @@ muon_parameters = []
 embed_params = []
 engram_params = []
 for n, p in model.named_parameters():
-    if p.ndim == 2 and "embed" not in n and "gate" not in n:
+    if p.ndim == 2 and "embed" not in n:
         muon_parameters.append(p)
     else:
         if "embed" not in n:
@@ -339,4 +341,6 @@ except torch.OutOfMemoryError as e:
     torch.cuda.empty_cache()
     print(e)
 save_model()
-dist.destroy_process_group()
+print("model saved")
+if world_size > 1:
+    dist.destroy_process_group()

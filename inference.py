@@ -65,7 +65,7 @@ print(f"model size in bytes: {model_size/1024**2:.1f}MiB")
 model.to("cuda")
 model.eval()
 model_opt = model
-#model_opt = torch.compile(model, dynamic=True)
+model_opt = torch.compile(model, dynamic=True)
 
 def color_bg(text, r, g, b):
     return f"\x1b[48;2;{int(r)};{int(g)};{int(b)}m{text}\x1b[0m"
@@ -88,21 +88,26 @@ while True:
             print(text, end="")
         else:
             print("\033[F", end='') # move cursor to the start of the previous line
-        for i in range(150):
-            logits, output_weights = model_opt(ids.unsqueeze(0),
-                        loop_steps=loop_steps,
-                        return_output_weights=True,
-            )
-            output_weights : Tensor = output_weights.squeeze(0)
-            logits = logits.squeeze(0)
-            new_id = torch.distributions.Categorical(logits=logits[-1]).sample()
-            ids = torch.cat([ids, new_id.unsqueeze(0)], 0)
-            output_weight_depth = (torch.arange(loop_steps, device="cuda")[None,:] * output_weights).sum(-1)[-1].item()
-            new_ids.append(new_id.item())
-            new_output_weight_depths.append(output_weight_depth)
-            if new_id.item() == tokenizer.eos_token_id:
-                print("<eos_token>")
+        
+        def stop_condition(ids : Tensor):
+            return ids[0,-1].item() == tokenizer.eos_token_id
+                
+        inference = model_opt.generate(
+            ids.unsqueeze(0),
+            loop_steps=loop_steps,
+            return_output_weights=True,
+            stop_condition=stop_condition,
+        )
+        
+        while True:
+            try:
+                new_id, output_weights = next(inference)
+            except StopIteration:
                 break
+            #ids = torch.cat([ids, new_id.squeeze(0)], 0)
+            output_weight_depth = (torch.arange(loop_steps, device="cuda")[None, None, :] * output_weights).sum(-1)[0, -1].item()
+            new_ids.append(new_id.squeeze(0).item())
+            new_output_weight_depths.append(output_weight_depth)
             try: 
                 new_text = tokenizer.decode(new_ids).encode().decode() # if the string doesn't contain errors
                 assert "�" not in new_text
@@ -111,9 +116,16 @@ while True:
                     r = 0 if len(new_ids) == 1 else 128
                     g = (1-t)**0.5*255
                     b = t**0.5*255
-                    print(color_bg(new_text, r, g, b), end="", flush=True)
                 else:
-                    print(new_text, end="", flush=True)
+                    r = 0
+                    b = 180
+                    g = 180
+                if new_text == "\n":
+                    new_text = " "
+                    print(color_bg(new_text, r, g, b), end="", flush=True)
+                    print()
+                else:
+                    print(color_bg(new_text, r, g, b), end="", flush=True)
                 new_ids = []
                 new_output_weight_depths = []
             except Exception as e:

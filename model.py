@@ -38,19 +38,6 @@ class ROPE(nn.Module):
     def forward(self, x):
         return rotary(x, self.cos.type_as(x), self.sin.type_as(x))
 
-class HalfROPE(nn.Module):
-    def __init__(self, dim : int, base : int, max_seq_len : int):
-        super().__init__()
-        freqs = (1/base) ** torch.linspace(0, 1, dim//4)
-        t = torch.arange(max_seq_len)
-        theta = torch.outer(t, freqs)
-        self.register_buffer("sin", theta.sin(), persistent=False)
-        self.register_buffer("cos", theta.cos(), persistent=False)
-    
-    def forward(self, x):
-        x1, x2 = x.chunk(2, -1)
-        return torch.cat([rotary(x1, self.cos.type_as(x), self.sin.type_as(x)), x2], -1)
-
 
 class CastedLinear(nn.Linear):
     def __init__(self, in_features, out_features, bias=True, device=None, dtype=torch.bfloat16):
@@ -84,8 +71,8 @@ class MLP(nn.Module):
     def __init__(self, dim):
         super().__init__()
         hdim = dim*4
-        self.up_lin = CastedLinear(dim, hdim, dtype=torch.bfloat16)
-        self.down_lin = CastedLinear(hdim, dim, dtype=torch.bfloat16)
+        self.up_lin = CastedLinear(dim, hdim)
+        self.down_lin = CastedLinear(hdim, dim)
         self.down_lin.weight.data.zero_()
     
     def forward(self, x):
@@ -108,15 +95,12 @@ class CausalSelfAttn(nn.Module):
         self.k_lin = CastedLinear(dim, dim)
         self.v_lin = CastedLinear(dim, dim)
         self.o_lin = CastedLinear(dim, dim)
-        #self.verification_lin = CastedLinear(self.head_dim, self.head_dim)
-        #self.verification_lin.weight.data.zero_()
         self.o_lin.weight.data.zero_()
         self.attn_gate = SliceLinear(20, num_heads)
 
         
     def forward(self, x : Tensor, args : AttnArgs):
         B, T, D = x.shape
-        assert B == 1 # varlen_func requires B == 1
         q = self.q_lin(x).view(B, T, self.num_heads, self.head_dim)
         k = self.k_lin(x).view(B, T, self.num_heads, self.head_dim)
         v = self.v_lin(x).view(B, T, self.num_heads, self.head_dim)
@@ -126,15 +110,17 @@ class CausalSelfAttn(nn.Module):
         
         q_r, k = rope(q), rope(k)
 
-        o = flash_attn_varlen_func(q_r[0], k[0], v[0], 
-                                cu_seqlens, cu_seqlens, 
-                                max_seqlen, max_seqlen,
+        if cu_seqlens is not None:
+            assert B == 1, "varlen_func requires B == 1"
+            o = flash_attn_varlen_func(q_r[0], k[0], v[0], 
+                                    cu_seqlens, cu_seqlens, 
+                                    max_seqlen, max_seqlen,
+                                    causal=True, window_size=(self.window_size, 0))
+        else:
+            o = flash_attn_func(q_r, k, v,
                                 causal=True, window_size=(self.window_size, 0))
-        #o = flash_attn_func(q, k, v, causal=True, window_size=(self.window_size, 0))
         o = o.view(B, T, self.num_heads, self.head_dim)
-        #o = o * (torch.sigmoid(self.attn_gate(x).view(B, T, self.num_heads, 1)) * torch.sigmoid(torch.mean(self.verification_lin(o) * q, -1, keepdim=True)))
         o = o * torch.sigmoid(self.attn_gate(x).view(B, T, self.num_heads, 1))
-        #o = o.transpose(1, 2).contiguous()
         o = o.view(B, T, D)
         return self.o_lin(o)
 
@@ -157,7 +143,6 @@ class CausalAttn(nn.Module):
         
     def forward(self, x_q : Tensor, x_kv, args : AttnArgs):
         B, T, D = x_q.shape
-        assert B == 1 # varlen_func requires B == 1
         q = self.q_lin(x_q).view(B, T, self.num_heads, self.head_dim)
         k = self.k_lin(x_kv).view(B, T, self.num_heads, self.head_dim)
         v = self.v_lin(x_kv).view(B, T, self.num_heads, self.head_dim)
@@ -167,15 +152,17 @@ class CausalAttn(nn.Module):
         
         q_r, k = rope(q), rope(k)
 
-        o = flash_attn_varlen_func(q_r[0], k[0], v[0], 
-                                cu_seqlens, cu_seqlens, 
-                                max_seqlen, max_seqlen,
+        if cu_seqlens is not None:
+            assert B == 1 # varlen_func requires B == 1
+            o = flash_attn_varlen_func(q_r[0], k[0], v[0], 
+                                    cu_seqlens, cu_seqlens, 
+                                    max_seqlen, max_seqlen,
+                                    causal=True, window_size=(self.window_size, 0))
+        else:
+            o = flash_attn_func(q_r, k, v,
                                 causal=True, window_size=(self.window_size, 0))
-        #o = flash_attn_func(q, k, v, causal=True, window_size=(self.window_size, 0))
         o = o.view(B, T, self.num_heads, self.head_dim)
         o = o * (torch.sigmoid(self.attn_gate(x_q).view(B, T, self.num_heads, 1)) * torch.sigmoid(torch.mean(self.verification_lin(o) * q, -1, keepdim=True)))
-        #o = o * torch.sigmoid(self.attn_gate(x_q).view(B, T, self.num_heads, 1))
-        #o = o.transpose(1, 2).contiguous()
         o = o.view(B, T, D)
         return self.o_lin(o)
 
@@ -186,14 +173,12 @@ class Block(nn.Module):
         self.mlp = MLP(dim)
         self.xs_gate = nn.Parameter(torch.zeros(dim))
         self.x0_gate = nn.Parameter(torch.zeros(dim))
-        #self.x_gate = nn.Parameter(torch.ones(dim))
     
-    def forward(self, x, args, xs = None, x0 = None):
+    def forward(self, x : Tensor, args : AttnArgs, xs = None, x0 = None):
         if xs is not None:
             x = x + xs * self.xs_gate.type_as(xs)
         if x0 is not None:
             x = x + x0 * self.x0_gate.type_as(x0)
-        #x = x * self.x_gate
         x = x + self.attn(norm(x), args)
         x = x + self.mlp(norm(x))
         return x
@@ -214,10 +199,12 @@ class EngramBlock(nn.Module):
 class Model(nn.Module):
     def __init__(self, num_embeddings, dim, num_layers, num_heads, window_size = -1, max_seq_len = 8192):
         super().__init__()
+        assert dim%num_heads==0
         self.dim = dim
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.window_size = window_size
+        self.max_seq_len = max_seq_len
         self.embed = nn.Embedding(num_embeddings, dim)
         self.value_embeds = nn.ModuleList([ShortEmbedding(num_embeddings, dim, 4) for i in range(3)])
         self.blocks = nn.ModuleList([Block(dim, num_heads, window_size) for i in range(num_layers)])
@@ -227,6 +214,8 @@ class Model(nn.Module):
         self.middle_block = Block(dim, num_heads, window_size*2)
         self.engram_block = EngramBlock(dim, num_heads, 2**16, engram_order=2, window_size=window_size)
         self.end_gate = SliceLinear(20, 1, slice_start=40) # use different slice from attn_gate
+        
+        
 
         # Weight tying improves learning efficiency
         self.embed.weight = self.un_embed.weight
@@ -234,18 +223,15 @@ class Model(nn.Module):
 
     def forward(self, ids, cu_seqlens = None, max_seqlen = None, loop_steps = 1, return_output_weights = False):
         assert loop_steps > 0
-        if max_seqlen is None or cu_seqlens is None:
-            cu_seqlens = torch.tensor([0, ids.size(1)], dtype=torch.int32, device=ids.device)
-            max_seqlen = ids.size(1)
         x0 = self.embed(ids).to(torch.bfloat16)
         x = x0
         half = len(self.blocks)//2
         ve = [embed(ids).to(torch.bfloat16) for embed in self.value_embeds]
         value_embeds = [None, ve[0], ve[1]] + [ve[2]]*(half-3)
-        #engram_embed = self.engram_lin(self.engram_embed(ids))
         outputs = []
         end_gates = []
         attn_args = AttnArgs(self.rope, cu_seqlens, max_seqlen)
+        
         for _ in range(loop_steps):
             skip_connections = []
             for block, v0 in zip(self.blocks[:half], value_embeds):
@@ -262,6 +248,7 @@ class Model(nn.Module):
             outputs.append(o)
             end_gates.append(torch.sigmoid(self.end_gate(x)))
         
+        
         cum_continue_prob = 1
         o_weights = [] # weights sum to 1
         for i, (o, cur_end_prob) in enumerate(zip(outputs, end_gates)):
@@ -277,6 +264,25 @@ class Model(nn.Module):
         if return_output_weights:
             return logits, torch.stack(o_weights, -1)
         return logits
+    
+    def generate(self, ids : Tensor, loop_steps = 1, temperature = 1, limit = 100, return_output_weights = False, stop_condition = None):
+
+        for i in range(limit):
+            logits, output_weights = self.forward(ids,
+                                loop_steps=loop_steps,
+                                return_output_weights=True,
+            )
+            new_id = torch.distributions.Categorical(logits=logits[:,-1:, :]/temperature).sample()
+            output_weights = output_weights[:,-1]
+            #ids = torch.cat([ids, new_id], 1)
+            ids = new_id
+            if stop_condition is not None:
+                if stop_condition(ids):
+                    return
+            if return_output_weights:
+                yield new_id, output_weights
+            else:
+                yield new_id
 
 
 if __name__ == "__main__":
