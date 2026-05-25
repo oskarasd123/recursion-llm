@@ -31,20 +31,23 @@ tokenizer.pad_token = tokenizer.eos_token
 
 hparams : dict = json.load(open(f"{model_path}metrics.json"))["hparams"]
 model_params : dict = hparams["model params"]
+print(hparams)
 
-model = Model(
-    num_embeddings=len(tokenizer),
-    dim=model_params["dim"],
-    num_layers=model_params["num_layers"],
-    num_heads=model_params["num_heads"],
-    window_size=model_params["window_size"],
-    max_seq_len=8192
-)
+print()
+for k, v in hparams["model params"].items():
+    print(f"{k}: {v}")
+print()
+
+model_args = {k:v for k, v in model_params.items()}
+assert model_args["num_embeddings"] == len(tokenizer)
+model_args["max_seq_len"] = 8192
+model_args.setdefault("has_engram", False)
+
+model = Model(**model_args)
+
 state_dict = torch.load(f"{model_path}checkpoint.pt", mmap=True)
 model.load_state_dict(state_dict["model"], strict=False)
 
-
-print(hparams)
 
 model_numel = 0
 embed_numel = 0
@@ -73,6 +76,8 @@ def color_bg(text, r, g, b):
 while True:
     try:
         text = input("\033[1;32;40m$\033[0;0;0mprompt: ")
+        if not text:
+            continue
         loop_steps = hparams.get("final loop_steps", 1)
         if "%" in text:
             try:
@@ -82,7 +87,9 @@ while True:
                 pass
         if not text == "c":
             prev_prompt = text
-            ids = tokenizer(text, return_tensors="pt")["input_ids"].cuda().squeeze(0)
+            ids = tokenizer(text)["input_ids"]
+            ids = [tokenizer.eos_token_id] + ids
+            ids = torch.tensor(ids).cuda()
             new_ids = []
             new_output_weight_depths = []
             print(text, end="")
@@ -95,6 +102,7 @@ while True:
         inference = model_opt.generate(
             ids.unsqueeze(0),
             loop_steps=loop_steps,
+            temperature = 1,
             return_output_weights=True,
             stop_condition=stop_condition,
         )

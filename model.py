@@ -184,38 +184,43 @@ class Block(nn.Module):
         return x
 
 class EngramBlock(nn.Module):
-    def __init__(self, dim, num_heads, table_size, engram_heads = 8, engram_order = 2, window_size = -1):
+    def __init__(self, dim, num_heads, window_size = -1):
         super().__init__()
-        self.engram_embed = EngramEmbeddings(table_size, dim, num_heads=engram_heads, ngram_order=engram_order, dtype=torch.bfloat16)
         self.attn = CausalAttn(dim, num_heads, window_size)
         self.mlp = MLP(dim)
     
-    def forward(self, x, ids, attn_args : AttnArgs):
-        engram = self.engram_embed(ids)
+    def forward(self, x, engram, attn_args : AttnArgs):
         x = x + self.attn(norm(x), engram, attn_args)
         x = x + self.mlp(norm(x))
         return x
 
 class Model(nn.Module):
-    def __init__(self, num_embeddings, dim, num_layers, num_heads, window_size = -1, max_seq_len = 8192):
+    def __init__(self, num_embeddings, dim, num_layers, num_heads, edge_layers = 0, window_size = -1, max_seq_len = 8192, has_engram = True):
         super().__init__()
         assert dim%num_heads==0
+        self.num_embeddings = num_embeddings
         self.dim = dim
         self.num_layers = num_layers
         self.num_heads = num_heads
+        self.edge_layers = edge_layers
         self.window_size = window_size
         self.max_seq_len = max_seq_len
+        self.has_engram = has_engram
         self.embed = nn.Embedding(num_embeddings, dim)
         self.value_embeds = nn.ModuleList([ShortEmbedding(num_embeddings, dim, 4) for i in range(3)])
-        self.blocks = nn.ModuleList([Block(dim, num_heads, window_size) for i in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(dim, num_heads, window_size) for i in range(num_layers - edge_layers*2 - has_engram)])
+        self.start_blocks = nn.ModuleList([Block(dim, num_heads, window_size) for i in range(edge_layers)])
+        self.end_blocks = nn.ModuleList([Block(dim, num_heads, window_size) for i in range(edge_layers)])
         self.rope = ROPE(dim//num_heads, 1000, max_seq_len)
-        self.un_embed = CastedLinear(dim, num_embeddings, bias=False)
         self.end_mlp = MLP(dim)
+        self.un_embed = CastedLinear(dim, num_embeddings, bias=False)
         self.middle_block = Block(dim, num_heads, window_size*2)
-        self.engram_block = EngramBlock(dim, num_heads, 2**16, engram_order=2, window_size=window_size)
+        if has_engram:
+            self.engram = EngramEmbeddings(2**20, dim, dtype=torch.bfloat16)
+            self.engram_block = EngramBlock(dim, num_heads)
+        else:
+            self.engram_block = None
         self.end_gate = SliceLinear(20, 1, slice_start=40) # use different slice from attn_gate
-        
-        
 
         # Weight tying improves learning efficiency
         self.embed.weight = self.un_embed.weight
@@ -232,6 +237,14 @@ class Model(nn.Module):
         end_gates = []
         attn_args = AttnArgs(self.rope, cu_seqlens, max_seqlen)
         
+        if self.has_engram:
+            engram = self.engram(ids)
+
+        outside_skip_connections = []
+        for block in self.start_blocks:
+            x = block(x, attn_args, x0=x0)
+            outside_skip_connections.append(x)
+        
         for _ in range(loop_steps):
             skip_connections = []
             for block, v0 in zip(self.blocks[:half], value_embeds):
@@ -239,12 +252,13 @@ class Model(nn.Module):
                 skip_connections.append(x)
             if len(self.blocks)%2!=0:
                 skip_connections.append(None)
-            x = self.engram_block(x, ids, attn_args)
+            if self.has_engram:
+                x = self.engram_block(x, engram, attn_args)
             x = self.middle_block(x, attn_args, xs=v0, x0=x0)
             for block, xs in zip(self.blocks[half:], reversed(skip_connections)):
                 x = block(x, attn_args, xs=xs, x0=x0)
             x = norm(x)
-            o = x + self.end_mlp(x) # mlp that transforms vectors from thought space into embedding space
+            o = x + self.end_mlp(x)
             outputs.append(o)
             end_gates.append(torch.sigmoid(self.end_gate(x)))
         
@@ -260,6 +274,9 @@ class Model(nn.Module):
 
         outputs = torch._foreach_mul(outputs, o_weights)
         o = torch.sum(torch.stack(outputs), 0)
+        for block, xs in zip(self.end_blocks, reversed(outside_skip_connections)):
+            o = block(o, attn_args, x0=x0, xs=xs)
+
         logits = self.un_embed(norm(o))
         if return_output_weights:
             return logits, torch.stack(o_weights, -1)
@@ -268,14 +285,13 @@ class Model(nn.Module):
     def generate(self, ids : Tensor, loop_steps = 1, temperature = 1, limit = 100, return_output_weights = False, stop_condition = None):
 
         for i in range(limit):
-            logits, output_weights = self.forward(ids,
+            logits, output_weights = self(ids,
                                 loop_steps=loop_steps,
                                 return_output_weights=True,
             )
             new_id = torch.distributions.Categorical(logits=logits[:,-1:, :]/temperature).sample()
             output_weights = output_weights[:,-1]
-            #ids = torch.cat([ids, new_id], 1)
-            ids = new_id
+            ids = torch.cat([ids, new_id], 1)
             if stop_condition is not None:
                 if stop_condition(ids):
                     return

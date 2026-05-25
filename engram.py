@@ -15,13 +15,13 @@ class EngramEmbeddings(nn.Module):
     ):
         """
         Args:
-            table_size: A large prime number representing the size of the lookup table.
-            embed_dim: The dimension of the retrieved memory vector.
-            num_heads: Number of independent hash functions (K).
-            ngram_order: The number of tokens to look back for the N-gram (N).
+            table_size: size of the lookup table (multiply by num_heads to get actual number).
+            embed_dim: The dimension of the retrieved memory vector. Table dim is embed_dim/num_heads
+            num_heads: Number of independent hash functions.
+            ngram_order: The number of tokens to look back for the N-gram.
         """
         super().__init__()
-        table_size = table_size * num_heads
+        table_size = table_size * num_heads # decouple num_heads from memory usage
         
         self.table_size = table_size
         self.embed_dim = embed_dim
@@ -31,10 +31,10 @@ class EngramEmbeddings(nn.Module):
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         self.head_dim = embed_dim // num_heads
 
-        self.memory_table = nn.Embedding(table_size, self.head_dim, dtype=dtype)
-        self.memory_table.weight.data.zero_()
+        self.embedding_table = nn.Embedding(table_size, self.head_dim, dtype=dtype)
+        self.embedding_table.weight.data.zero_()
 
-        primes = torch.randint(1000000, 1000000000, (num_heads, ngram_order))
+        primes = torch.randint(1000000, 100000000, (num_heads, ngram_order))
         self.register_buffer("hash_primes", primes)
         self.register_buffer("compression_map", compression_map)
 
@@ -78,8 +78,8 @@ class EngramEmbeddings(nn.Module):
         hash_val = mixed_ngrams[..., 0]
         for i in range(1, self.ngram_order):
             # Bitwise XOR across the N-gram dimension
-            hash_val = hash_val ^ mixed_ngrams[..., i]
             hash_val = hash_val * 0x84fbca63
+            hash_val = hash_val ^ mixed_ngrams[..., i]
             
         hash_val = hash_val ^ (hash_val >> 16)
         hash_val = hash_val * 0x85ebca6b
@@ -106,7 +106,7 @@ class EngramEmbeddings(nn.Module):
         if self.compression_map is not None:
             input_ids = self.compression_map[input_ids]
         hashes = self.get_ngram_hashes(input_ids) 
-        retrieved_embeds = self.memory_table(hashes) 
+        retrieved_embeds = self.embedding_table(hashes) 
 
         memory_output = retrieved_embeds.view(batch_size, seq_len, self.embed_dim)
         if with_hashes:

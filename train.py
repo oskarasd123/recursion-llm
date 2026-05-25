@@ -5,7 +5,7 @@ import torch
 from torch import nn, Tensor, optim
 import torch.nn.functional as F
 import muon # no muon in torch==2.8.0
-from dataloader import FineWebDataLoader, MaxLenFineWebDataLoader, InstructionDataset
+from dataloader import MaxLenFineWebDataLoader, InstructionDataset
 from tokenizer_compressor import create_token_compression_map
 from transformers import AutoTokenizer
 import numpy as np
@@ -22,7 +22,7 @@ torch._dynamo.config.capture_scalar_outputs = True
 #torch.autograd.set_detect_anomaly(True)
 
 # most hparams are here
-steps = 10000
+steps = 5000
 base_grad_accum_steps = 32
 batch_size = 4096
 start_lr = 0.5e-2
@@ -61,7 +61,7 @@ def get_lr(step): # learning rate multiplier applied on start_lr
 
 def get_loop_steps(step):
     frac = step/steps
-    return 1
+    return 4
 
 def get_grad_accum_steps(step):
     if step < 2000:
@@ -81,23 +81,27 @@ dir_index = max(list(map(int, os.listdir(log_dir))) + [-1]) + (0 if load_checkpo
 log_dir = f"{log_dir}{dir_index}/"
 print0(f"using logdir: {log_dir}")
 
+
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
 tokenizer.pad_token = tokenizer.eos_token
 
 dataset = MaxLenFineWebDataLoader(tokenizer, subset="sample-10BT", edu=True, max_length=batch_size, num_val_documents=10000)
 val_dataset = MaxLenFineWebDataLoader(tokenizer, subset="sample-10BT", edu=True, max_length=batch_size, num_val_documents=10000, val=True)
 instruction_dataset = InstructionDataset(tokenizer, batch_size) # used for validation
-train_dataloader = DataLoader(dataset, batch_size=1, num_workers=1)
-test_dataloader = DataLoader(val_dataset, batch_size=1, num_workers=1)
-instruction_dataloader = DataLoader(instruction_dataset, batch_size=1, num_workers=1)
+train_dataset = dataset
+train_dataloader = DataLoader(train_dataset, batch_size=1, num_workers=1, pin_memory=True)
+test_dataloader = DataLoader(val_dataset, batch_size=1, num_workers=1, pin_memory=True)
+instruction_dataloader = DataLoader(instruction_dataset, batch_size=1, num_workers=1, pin_memory=True)
 
 model = Model(
     num_embeddings=len(tokenizer),
     dim=128*4,
     num_layers=12,
     num_heads=4,
-    window_size=512,
+    edge_layers=4,
+    window_size=128,
     max_seq_len=batch_size,
+    has_engram=True,
 ).to(device)
 model_opt = model
 model_opt = torch.compile(model)
@@ -140,8 +144,11 @@ for n, p in model.named_parameters():
 optimizer1 = optim.AdamW(adam_parameters, lr = start_lr, betas=(0.9, 0.95), weight_decay=0.1, fused=True)
 optimizer2 = optim.AdamW(embed_params, lr = start_lr, betas=(0.9, 0.95), weight_decay=0.1, fused=True)
 optimizer3 = muon.Muon(muon_parameters, lr = start_lr, momentum=0.8)
-optimizer4 = optim.SparseAdam(engram_params, lr = start_lr, betas=(0.9, 0.999))
-optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
+if engram_params:
+    optimizer4 = optim.SparseAdam(engram_params, lr = start_lr, betas=(0.9, 0.999))
+    optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
+else:
+    optimizers = [optimizer1, optimizer2, optimizer3]
 
 for opt in optimizers:
     for group in opt.param_groups:
@@ -213,10 +220,13 @@ def save_model():
         json.dump({
             "hparams": {
                 "model params":{
+                    "num_embeddings":model.num_embeddings,
                     "num_layers" : model.num_layers,
                     "dim" : model.dim,
                     "num_heads" : model.num_heads,
-                    "window_size" : model.window_size
+                    "window_size" : model.window_size,
+                    "has_engram" : model.has_engram,
+                    "edge_layers" : model.edge_layers,
                 },
                 "steps" : steps,
                 "step" : step,
@@ -341,6 +351,6 @@ except torch.OutOfMemoryError as e:
     torch.cuda.empty_cache()
     print(e)
 save_model()
-print("model saved")
+print0("model saved")
 if world_size > 1:
     dist.destroy_process_group()

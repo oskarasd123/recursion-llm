@@ -1,4 +1,5 @@
 import os
+import random
 
 import torch
 from datasets import load_dataset
@@ -20,6 +21,7 @@ class FineWebDataLoader(IterableDataset):
         self.seed = seed
         self.num_val_documents = num_val_documents
         self.val = val
+        self.start = 0
         
         self.dataset = load_dataset(
             "HuggingFaceFW/fineweb" + ("-edu" if edu else ""), 
@@ -35,7 +37,8 @@ class FineWebDataLoader(IterableDataset):
         lengths = []
         texts = []
         range_start = (0 if self.val else self.num_val_documents)
-        range_end = (self.num_val_documents if self.val else len(self.dataset))
+        range_end = (self.num_val_documents+self.start if self.val else len(self.dataset))
+        self.start = 0
         for i in range(range_start, range_end):
             if i % self.world_size != self.rank:
                 continue
@@ -79,7 +82,8 @@ class MaxLenFineWebDataLoader(FineWebDataLoader):
         lengths = []
         texts = []
         range_start = (0 if self.val else self.num_val_documents)
-        range_end = (self.num_val_documents if self.val else len(self.dataset))
+        range_end = (self.num_val_documents+self.start if self.val else len(self.dataset))
+        self.start = 0
         for i in range(range_start, range_end):
             if i % self.world_size != self.rank:
                 continue
@@ -89,7 +93,7 @@ class MaxLenFineWebDataLoader(FineWebDataLoader):
                 text,
                 truncation=True
             )["input_ids"]
-            tokens = tokens + [self.tokenizer.eos_token_id]
+            tokens = [self.tokenizer.eos_token_id] + tokens + [self.tokenizer.eos_token_id]
             while sum(lengths) + len(tokens) > self.max_length:
                 split_pos = self.max_length-sum(lengths)
                 current = tokens[:split_pos]
@@ -162,7 +166,30 @@ class InstructionDataset(FineWebDataLoader):
         dict["texts"] = texts
         yield dict
 
-
+class MixDataset(IterableDataset):
+    def __init__(self, ds1, ds2, ratio : float):
+        "Randomly takes batches from the datasets with a probability (ratio) to take from the second one."
+        self.ds1 = ds1
+        self.ds2 = ds2
+        self.ratio = ratio
+    
+    def __iter__(self):
+        ds1_iter = iter(self.ds1)
+        ds2_iter = iter(self.ds2)
+        
+        while True:
+            if random.random() < self.ratio:
+                try:
+                    yield next(ds2_iter)
+                except StopIteration:
+                    ds2_iter = iter(self.ds2)
+                    yield next(ds2_iter)
+            else:
+                try:
+                    yield next(ds1_iter)
+                except StopIteration:
+                    ds1_iter = iter(self.ds1)
+                    yield next(ds1_iter)
 
 
 if __name__ == "__main__":
@@ -184,23 +211,30 @@ if __name__ == "__main__":
     
     compression_map = create_token_compression_map(tokenizer, True)
     ngram_order = 2
-    engrams = [EngramEmbeddings(2**17, 64, compression_map, 1, ngram_order) for i in range(5)]
+    engram = EngramEmbeddings(2**20, 64, compression_map, 1, ngram_order)
     
 
     hashes_func1 = 0
     hashes_func2 = 0
     ideal_hashes = 0
     ideal_uncompressed_hashes = 0
+    all_hashes = torch.tensor([], dtype=torch.int32)
     iterator = iter(dataloader)
     filled = []
-    batches = 512
+    batches = 4096
+    print("processing statistics")
     for i in range(batches):
+        print(f"\r{i}/{batches}", end="")
         batch = next(iterator)
         length = batch["input_ids"].shape[1]
         fill_frac = length/max_len
         filled.append(fill_frac)
-        hashes_func1 += sum([engram.get_ngram_hashes(batch["input_ids"]).unique().numel() for engram in engrams]) / len(engrams)
-        hashes_func2 += sum([engram.get_chaotic_ngram_hashes(batch["input_ids"]).unique().numel() for engram in engrams]) / len(engrams)
+        
+        hashes_func1 += engram.get_ngram_hashes(batch["input_ids"]).unique().numel()
+        hashes_func2 += engram.get_chaotic_ngram_hashes(batch["input_ids"]).unique().numel()
+        
+        all_hashes = torch.cat([all_hashes, engram.get_chaotic_ngram_hashes(batch["input_ids"]).unique()]).unique()
+        
         input_ids = compression_map[batch["input_ids"]]
         padded_ids = F.pad(input_ids, (ngram_order-1, 0), value=0)
         ngrams = padded_ids.unfold(dimension=1, size=ngram_order, step=1).to(torch.int64) # (batch, seq_len, ngram_order)
@@ -212,6 +246,7 @@ if __name__ == "__main__":
         pairs = ngrams[:, :, 0] + ngrams[:, :, 1] * len(tokenizer)
         ideal_uncompressed_hashes += pairs.unique().numel()
         assert length <= max_len
+    print()
     print(f"fill frac: {np.mean(filled)}\n"\
           f"min filled: {np.min(filled)}\n"\
           f"max filled: {np.max(filled)}"
@@ -220,6 +255,8 @@ if __name__ == "__main__":
     print("hash function 2 average unique hashes:", hashes_func2/batches)
     print("ideal average unique hashes:", ideal_hashes/batches)
     print("ideal average uncompressed unique hashes:", ideal_uncompressed_hashes/batches)
+    print(f"unused engram table frac: {1-all_hashes.numel()/engram.table_size}")
+    batches = 512
     start_time = perf_counter()
     for i in range(batches):
         batch = next(iterator)
